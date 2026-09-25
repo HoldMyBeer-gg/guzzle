@@ -2,8 +2,10 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readTextFile } from "@tauri-apps/plugin-fs";
 import { useSession } from "./store/session";
-import { resolveIncludes } from "./lib/tauri";
+import { resolveIncludes, extractSymbols } from "./lib/tauri";
+import { isBinaryFile, BINARY_EXTENSIONS } from "./lib/fileUtils";
 import SourceViewer from "./components/SourceViewer";
+import SymbolPicker from "./components/SymbolPicker";
 import Wizard from "./components/Wizard";
 
 async function afterOpen(
@@ -29,14 +31,35 @@ async function afterOpen(
 }
 
 function HomePage({ onOpen }: { onOpen: () => void }) {
-  const { recentFiles, setFilePath, addRecentFile, updateCompileSettings, setResolvedHeaders } = useSession();
+  const {
+    recentFiles,
+    setFilePath,
+    addRecentFile,
+    updateCompileSettings,
+    setResolvedHeaders,
+    setBinaryMode,
+    setExportedSymbols,
+    setSymbolsLoading,
+  } = useSession();
   const [recentError, setRecentError] = useState<string | null>(null);
 
   const openRecent = async (path: string) => {
     setRecentError(null);
     try {
-      const content = await readTextFile(path);
-      await afterOpen(path, content, setFilePath, updateCompileSettings, setResolvedHeaders);
+      if (isBinaryFile(path)) {
+        setBinaryMode(true, path);
+        setSymbolsLoading(true);
+        try {
+          const result = await extractSymbols(path);
+          setExportedSymbols(result.symbols);
+        } finally {
+          setSymbolsLoading(false);
+        }
+      } else {
+        const content = await readTextFile(path);
+        setBinaryMode(false, null);
+        await afterOpen(path, content, setFilePath, updateCompileSettings, setResolvedHeaders);
+      }
       addRecentFile(path);
     } catch (e) {
       console.error("Failed to open recent file", e);
@@ -51,7 +74,7 @@ function HomePage({ onOpen }: { onOpen: () => void }) {
           ⚡ Guzzle
         </h1>
         <p className="text-[#8b949e] text-lg">
-          libFuzzer made easy — open a C/C++ file and fuzz any function in minutes.
+          libFuzzer made easy — open a C/C++ source file or a binary library and fuzz any function in minutes.
         </p>
       </div>
 
@@ -59,7 +82,7 @@ function HomePage({ onOpen }: { onOpen: () => void }) {
         onClick={onOpen}
         className="px-8 py-4 bg-[#238636] hover:bg-[#2ea043] text-white font-semibold rounded-xl text-lg transition-colors shadow-lg"
       >
-        Open C/C++ File…
+        Open File…
       </button>
 
       {recentError && (
@@ -110,29 +133,81 @@ function Header({ filePath, onOpen }: { filePath: string | null; onOpen: () => v
   );
 }
 
-export default function App() {
-  const { filePath, setFilePath, addRecentFile, updateCompileSettings, setResolvedHeaders } = useSession();
 
-  const handleOpen = async () => {
+export default function App() {
+  const {
+    filePath,
+    isBinaryMode,
+    setFilePath,
+    addRecentFile,
+    updateCompileSettings,
+    setResolvedHeaders,
+    setBinaryMode,
+    setExportedSymbols,
+    setSymbolsLoading,
+  } = useSession();
+
+  const [openError, setOpenError] = useState<string | null>(null);
+
+  const afterOpenBinary = async (path: string) => {
+    setBinaryMode(true, path);
+    setSymbolsLoading(true);
+    setOpenError(null);
     try {
-      const selected = await open({
-        filters: [{ name: "C/C++ Files", extensions: ["c", "cpp", "cc", "cxx", "h", "hpp"] }],
-        multiple: false,
-      });
-      if (typeof selected === "string") {
-        const content = await readTextFile(selected);
-        await afterOpen(selected, content, setFilePath, updateCompileSettings, setResolvedHeaders);
-        addRecentFile(selected);
-      }
+      const result = await extractSymbols(path);
+      setExportedSymbols(result.symbols);
     } catch (e) {
-      console.error("File open error", e);
+      setOpenError(`Failed to extract symbols: ${String(e)}`);
+    } finally {
+      setSymbolsLoading(false);
     }
   };
 
+  const handleOpen = async () => {
+    setOpenError(null);
+    try {
+      const selected = await open({
+        filters: [
+          { name: "C/C++ Files", extensions: ["c", "cpp", "cc", "cxx", "h", "hpp"] },
+          { name: "Binary / Library", extensions: BINARY_EXTENSIONS },
+          { name: "All Files", extensions: ["*"] },
+        ],
+        multiple: false,
+      });
+      if (typeof selected === "string") {
+        if (isBinaryFile(selected)) {
+          await afterOpenBinary(selected);
+          addRecentFile(selected);
+        } else {
+          const content = await readTextFile(selected);
+          setBinaryMode(false, null);
+          await afterOpen(selected, content, setFilePath, updateCompileSettings, setResolvedHeaders);
+          addRecentFile(selected);
+        }
+      }
+    } catch (e) {
+      setOpenError(`Could not open file: ${String(e)}`);
+    }
+  };
+
+  // Effective path for the header (binary mode uses binaryPath, source mode uses filePath)
+  const { binaryPath } = useSession();
+  const displayPath = isBinaryMode ? binaryPath : filePath;
+  const hasFile = isBinaryMode ? !!binaryPath : !!filePath;
+
   return (
     <div className="flex flex-col h-screen">
-      {filePath && <Header filePath={filePath} onOpen={handleOpen} />}
-      {filePath ? <SourceViewer /> : <HomePage onOpen={handleOpen} />}
+      {hasFile && <Header filePath={displayPath} onOpen={handleOpen} />}
+      {openError && (
+        <div className="px-4 py-2 bg-[#3d1414] border-b border-[#f85149] text-sm text-[#f85149]">
+          {openError}
+        </div>
+      )}
+      {hasFile
+        ? isBinaryMode
+          ? <SymbolPicker />
+          : <SourceViewer />
+        : <HomePage onOpen={handleOpen} />}
       <Wizard />
     </div>
   );

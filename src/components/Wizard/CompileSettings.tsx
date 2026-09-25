@@ -27,6 +27,8 @@ export default function CompileSettings({ onBack, onNext }: Props) {
     setCompiledBinaryPath,
     appendCompileLog,
     clearCompileLog,
+    isBinaryMode,
+    binaryPath,
   } = useSession();
 
   const [compiling, setCompiling] = useState(false);
@@ -70,7 +72,8 @@ export default function CompileSettings({ onBack, onNext }: Props) {
   };
 
   const runCompile = async () => {
-    if (!filePath || !harnessSource) return;
+    if (!harnessSource) return;
+    if (!isBinaryMode && !filePath) return;
     setCompiling(true);
     setCompileError(false);
     clearCompileLog();
@@ -82,14 +85,28 @@ export default function CompileSettings({ onBack, onNext }: Props) {
         appendCompileLog(e.payload);
       });
 
-      // Headers aren't compiled as source — the library files provide the implementation
-      const isHeader = /\.(h|hpp)$/i.test(filePath);
-      const binaryPath = await compileHarness({
+      let targetFiles: string[];
+      let settings = compileSettings;
+
+      if (isBinaryMode && binaryPath) {
+        // Binary mode: no source target files; auto-inject the opened binary into library_files
+        targetFiles = [];
+        const alreadyLinked = settings.library_files.includes(binaryPath);
+        if (!alreadyLinked) {
+          settings = { ...settings, library_files: [binaryPath, ...settings.library_files] };
+        }
+      } else {
+        // Source mode: headers aren't compiled as source
+        const isHeader = /\.(h|hpp)$/i.test(filePath!);
+        targetFiles = isHeader ? [] : [filePath!];
+      }
+
+      const compiledPath = await compileHarness({
         harness: harnessSource,
-        targetFiles: isHeader ? [] : [filePath],
-        settings: compileSettings,
+        targetFiles,
+        settings,
       });
-      setCompiledBinaryPath(binaryPath);
+      setCompiledBinaryPath(compiledPath);
     } catch (e) {
       appendCompileLog(`\nError: ${String(e)}`);
       setCompileError(true);
@@ -172,19 +189,30 @@ export default function CompileSettings({ onBack, onNext }: Props) {
             + Add library
           </button>
         </div>
-        {compileSettings.library_files.length === 0 ? (
+        {/* In binary mode, show the opened binary as a locked auto entry */}
+        {isBinaryMode && binaryPath && (
+          <div className="flex items-center gap-2 mb-1">
+            <code className="text-xs text-[#e6edf3] font-mono flex-1 truncate">{binaryPath}</code>
+            <span className="text-[10px] text-[#8b949e] bg-[#21262d] border border-[#30363d] rounded px-1.5 py-0.5 flex-shrink-0">
+              auto — opened binary
+            </span>
+          </div>
+        )}
+        {compileSettings.library_files.length === 0 && !(isBinaryMode && binaryPath) ? (
           <p className="text-xs text-[#8b949e] italic">
             None — add pre-built libraries to fuzz against (e.g. libssl.a)
           </p>
         ) : (
-          compileSettings.library_files.map((lib) => (
-            <div key={lib} className="flex items-center gap-2 mb-1">
-              <code className="text-xs text-[#e6edf3] font-mono flex-1 truncate">{lib}</code>
-              <button onClick={() => removeLibraryFile(lib)} className="text-[#f85149] text-xs hover:underline flex-shrink-0">
-                remove
-              </button>
-            </div>
-          ))
+          compileSettings.library_files
+            .filter((lib) => !(isBinaryMode && lib === binaryPath))
+            .map((lib) => (
+              <div key={lib} className="flex items-center gap-2 mb-1">
+                <code className="text-xs text-[#e6edf3] font-mono flex-1 truncate">{lib}</code>
+                <button onClick={() => removeLibraryFile(lib)} className="text-[#f85149] text-xs hover:underline flex-shrink-0">
+                  remove
+                </button>
+              </div>
+            ))
         )}
       </div>
 

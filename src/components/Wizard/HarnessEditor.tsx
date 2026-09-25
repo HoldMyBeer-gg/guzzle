@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import MonacoEditor from "@monaco-editor/react";
 import { useSession, PRESET_PROVIDERS, type AiProvider } from "../../store/session";
-import { generateHarness, saveApiKey, loadApiKey, getCachedHarness, saveCachedHarness } from "../../lib/tauri";
+import { generateHarness, generateHarnessBinary, saveApiKey, loadApiKey, getCachedHarness, saveCachedHarness } from "../../lib/tauri";
 
 interface Props {
   onBack: () => void;
@@ -25,6 +25,10 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
     harnessGenerating,
     resolvedHeaders,
     aiProvider,
+    isBinaryMode,
+    binaryPath,
+    selectedSymbolName,
+    companionHeaderContent,
     setHarnessSource,
     setHarnessGenerating,
     setAiProvider,
@@ -121,7 +125,8 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
   };
 
   const generate = async () => {
-    if (!functionSignature) return;
+    if (!isBinaryMode && !functionSignature) return;
+    if (isBinaryMode && !selectedSymbolName) return;
     const needsKey = provider.format !== "openai" || provider.name !== "ollama";
     if (needsKey && !provider.api_key.trim() && provider.name !== "ollama") {
       setError("Enter an API key for this provider.");
@@ -134,7 +139,17 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
     // Commit provider to store
     setAiProvider(provider);
     try {
-      const harness = await generateHarness(provider, functionSignature, getContextLines(), resolvedHeaders.length > 0 ? resolvedHeaders : undefined);
+      let harness: string;
+      if (isBinaryMode && selectedSymbolName) {
+        harness = await generateHarnessBinary(
+          provider,
+          selectedSymbolName,
+          companionHeaderContent ?? null,
+          resolvedHeaders.length > 0 ? resolvedHeaders : undefined,
+        );
+      } else {
+        harness = await generateHarness(provider, functionSignature!, getContextLines(), resolvedHeaders.length > 0 ? resolvedHeaders : undefined);
+      }
       setHarnessSource(harness);
     } catch (e) {
       setError(String(e));
@@ -145,8 +160,12 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
 
   // Auto-generate on first open — check cache before calling AI
   useEffect(() => {
-    if (!harnessSource && !harnessGenerating && functionSignature && filePath) {
-      getCachedHarness(filePath, functionSignature.name)
+    const cacheKey = isBinaryMode
+      ? (binaryPath && selectedSymbolName ? { path: binaryPath, fn: selectedSymbolName } : null)
+      : (filePath && functionSignature ? { path: filePath, fn: functionSignature.name } : null);
+
+    if (!harnessSource && !harnessGenerating && cacheKey) {
+      getCachedHarness(cacheKey.path, cacheKey.fn)
         .then((cached) => {
           if (cached) {
             setHarnessSource(cached);
@@ -172,7 +191,9 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
         <h2 className="text-lg font-semibold text-[#e6edf3]">Harness Editor</h2>
         <p className="text-sm text-[#8b949e] mt-1">
           AI-generated fuzzing harness for{" "}
-          <code className="text-[#d2a8ff]">{functionSignature?.name}</code>. Review and edit before compiling.
+          <code className="text-[#d2a8ff]">
+            {isBinaryMode ? selectedSymbolName : functionSignature?.name}
+          </code>. Review and edit before compiling.
         </p>
       </div>
 
@@ -346,8 +367,12 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
           onClick={() => {
             // Commit provider (including loaded API key) to store so Results.tsx has it
             setAiProvider(provider);
-            if (filePath && functionSignature && harnessSource) {
-              void saveCachedHarness(filePath, functionSignature.name, harnessSource);
+            if (harnessSource) {
+              if (isBinaryMode && binaryPath && selectedSymbolName) {
+                void saveCachedHarness(binaryPath, selectedSymbolName, harnessSource);
+              } else if (filePath && functionSignature) {
+                void saveCachedHarness(filePath, functionSignature.name, harnessSource);
+              }
             }
             onNext();
           }}

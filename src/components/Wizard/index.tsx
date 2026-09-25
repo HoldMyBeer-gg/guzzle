@@ -9,7 +9,15 @@ import Results from "./Results";
 import type { FunctionSignature } from "../../store/session";
 
 export default function Wizard() {
-  const { wizardOpen, wizardStep, setWizardStep, closeWizard, functionSignature } = useSession();
+  const {
+    wizardOpen,
+    wizardStep,
+    setWizardStep,
+    closeWizard,
+    functionSignature,
+    isBinaryMode,
+    selectedSymbolName,
+  } = useSession();
 
   // Lock the signature at open time so the background Monaco editor's cursor
   // events (which temporarily null out functionSignature during re-parses)
@@ -20,7 +28,11 @@ export default function Wizard() {
     if (!wizardOpen) setLockedSig(null);
   }, [wizardOpen, functionSignature]);
 
-  if (!wizardOpen || !lockedSig) return null;
+  // In binary mode we don't need a function signature — just a selected symbol name.
+  const canOpen = isBinaryMode ? !!selectedSymbolName : !!lockedSig;
+  if (!wizardOpen || !canOpen) return null;
+
+  const subtitle = isBinaryMode ? `${selectedSymbolName}()` : `${lockedSig!.name}()`;
 
   const goTo = (step: typeof wizardStep) => setWizardStep(step);
 
@@ -35,7 +47,7 @@ export default function Wizard() {
           <div className="flex items-center gap-3">
             <span className="text-lg">⚡</span>
             <span className="font-semibold text-[#e6edf3]">Fuzz Wizard</span>
-            <span className="text-sm text-[#8b949e]">— {lockedSig.name}()</span>
+            <span className="text-sm text-[#8b949e]">— {subtitle}</span>
           </div>
           <button
             onClick={closeWizard}

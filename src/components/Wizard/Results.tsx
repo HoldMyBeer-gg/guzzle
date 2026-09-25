@@ -64,6 +64,7 @@ export default function Results({ onClose }: Props) {
   } = useSession();
   const [selected, setSelected] = useState<CrashFile | null>(null);
   const [loading, setLoading] = useState(true);
+  const [crashReadError, setCrashReadError] = useState<string | null>(null);
   const [pocStates, setPocStates] = useState<Record<string, PocState>>({});
 
   useEffect(() => {
@@ -74,7 +75,7 @@ export default function Results({ onClose }: Props) {
         const files = await readCrashFiles(corpusDir);
         setCrashes(files);
       } catch (e) {
-        console.error("Failed to read crash files, using in-memory state:", e);
+        setCrashReadError(`Could not re-read crash files from disk — showing in-memory results. (${String(e)})`);
       } finally {
         setLoading(false);
       }
@@ -162,6 +163,12 @@ export default function Results({ onClose }: Props) {
           Open .guzzle/ folder →
         </button>
       </div>
+
+      {crashReadError && (
+        <div className="bg-[#3d2f00] border border-[#d29922] rounded-md p-2 text-xs text-[#d29922]">
+          ⚠ {crashReadError}
+        </div>
+      )}
 
       {loading ? (
         <div className="flex items-center gap-3 py-8 justify-center">

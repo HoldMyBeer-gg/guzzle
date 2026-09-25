@@ -6,3 +6,4 @@ pub mod fuzzer;
 pub mod poc;
 pub mod cache;
 pub mod includes;
+pub mod symbols;

@@ -124,6 +124,7 @@ pub async fn compile_harness(
     let out_path = if settings.out_path.is_empty() {
         let target_dir = target_files
             .first()
+            .or_else(|| settings.library_files.first())
             .and_then(|f| PathBuf::from(f).parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         let guzzle_dir = target_dir.join(".guzzle");

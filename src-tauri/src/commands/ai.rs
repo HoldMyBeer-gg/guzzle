@@ -180,6 +180,132 @@ Return ONLY the C/C++ source code, no markdown fences."#,
     (system, user)
 }
 
+fn build_binary_prompt(
+    symbol_name: &str,
+    include_hints: &[String],
+    companion_header: Option<&str>,
+) -> (String, String) {
+    let system = "You are an expert C/C++ security engineer specializing in fuzzing with libFuzzer. \
+        Generate minimal, correct, safe fuzzer harnesses. \
+        Output only raw C/C++ source code with no markdown fences and no explanation."
+        .to_string();
+
+    let header_section = if let Some(hdr) = companion_header {
+        format!(
+            "A companion header is provided — use the exact types and signature from it:\n\
+             ```c\n{hdr}\n```\n"
+        )
+    } else {
+        format!(
+            "No header is available. Declare the function with `extern \"C\"` using common \
+             conventions for the function name `{symbol_name}`. For example:\n\
+             ```c\nextern \"C\" int {symbol_name}(/* inferred params */);\n```\n"
+        )
+    };
+
+    let extern_c_rule = if companion_header.is_none() {
+        "\n13. Declare the target function with `extern \"C\"` before calling it — \
+             it lives in a pre-built binary and has C linkage."
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    let user = format!(
+        r#"Generate a libFuzzer harness that fuzzes the function `{symbol_name}` from a pre-built binary library.
+
+{header_section}
+Requirements:
+1. Implement `extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)`
+
+2. Prefer FuzzedDataProvider (`<fuzzer/FuzzedDataProvider.h>`) for typed arguments:
+     FuzzedDataProvider fdp(data, size);
+   Declare and initialize it in one statement — it has no default constructor and
+   its copy-assignment operator is deleted. Fall back to raw data/size only when
+   the function genuinely expects an unstructured byte buffer.
+
+3. Derive valid arguments for `{symbol_name}` from the fuzzer input.
+   Guard against null pointers and out-of-bounds access before each call.
+
+4. Include only standard C/C++ headers (`<stdint.h>`, `<stddef.h>`, `<stdlib.h>`,
+   `<string.h>`, `<stdio.h>`). Do NOT use `<unistd.h>`, `<fcntl.h>`, or any
+   other POSIX-only header — the harness must also compile on Windows.
+
+5. Do NOT call exit() or abort().
+
+6. Do NOT use mkstemp or any platform-specific temp-file API. Use a fixed path:
+   `"/tmp/guzzle_input"` on Linux/macOS, `"C:\\Temp\\guzzle_input"` on Windows
+   (guard with `#ifdef _WIN32`). Do NOT write to the current directory.
+
+7. Do NOT add `#define _CRT_SECURE_NO_WARNINGS` — it is already a compiler flag.
+
+8. The harness is compiled as C++ (`clang++ -x c++`). Cast every malloc/realloc:
+   `MyType *p = (MyType *)malloc(n);`
+
+9. Zero-initialize output structs before passing them to the target:
+   `MyStruct s = {{0}};`
+
+10. Free each heap pointer exactly once. For tagged/union fields use if/else so
+    no pointer is freed in more than one branch.
+
+11. If the context includes a "// Macro definitions from source file:" section,
+    copy every `#define` from it verbatim into the harness before any use.
+
+12. Do NOT include any source-context section — this is a pre-built binary with
+    no source available.{extern_c_rule}
+{include_rule}
+Return ONLY the C/C++ source code, no markdown fences."#,
+        include_rule = if include_hints.is_empty() {
+            String::new()
+        } else {
+            let list = include_hints.iter()
+                .map(|h| format!("   <{h}>"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let rule_num = if companion_header.is_none() { 14 } else { 13 };
+            format!(
+                "\n{rule_num}. The following system headers were confirmed to exist on this machine — \
+                you MAY use #include <...> for any of them:\n{list}\n    \
+                Do NOT #include library headers that are not in this list."
+            )
+        },
+    );
+
+    (system, user)
+}
+
+#[tauri::command]
+pub async fn generate_harness_binary(
+    provider: AiProvider,
+    symbol_name: String,
+    companion_header_content: Option<String>,
+    include_hints: Option<Vec<String>>,
+) -> Result<String, String> {
+    let hints = include_hints.unwrap_or_default();
+    let (system, user) = build_binary_prompt(
+        &symbol_name,
+        &hints,
+        companion_header_content.as_deref(),
+    );
+    let client = make_client()?;
+
+    let raw = match provider.format {
+        ApiFormat::Openai => call_openai_compat(&client, &provider, system, user).await,
+        ApiFormat::Anthropic => call_anthropic(&client, &provider, system, user).await,
+    }?;
+
+    // Close any unclosed braces if the model was cut off
+    let open: i32 = raw.chars().filter(|&c| c == '{').count() as i32;
+    let close: i32 = raw.chars().filter(|&c| c == '}').count() as i32;
+    let raw = if open > close {
+        format!("{}\n{}", raw, "}".repeat((open - close) as usize))
+    } else {
+        raw
+    };
+
+    Ok(raw)
+}
+
 fn make_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         // AI responses (especially PoC scripts) can take a while — 5 min timeout.
@@ -472,6 +598,57 @@ mod tests {
         let (_, user) = build_prompt(&sig, "", &[]);
         assert!(!user.contains("confirmed to exist"),
             "include hint rule must be absent when no hints provided");
+    }
+
+    // ── build_binary_prompt tests ────────────────────────────────────────────
+
+    #[test]
+    fn binary_prompt_contains_symbol_name() {
+        let (_, user) = build_binary_prompt("compress2", &[], None);
+        assert!(user.contains("compress2"), "prompt must mention the symbol name");
+    }
+
+    #[test]
+    fn binary_prompt_no_source_context_section() {
+        let (_, user) = build_binary_prompt("compress2", &[], None);
+        assert!(!user.contains("Surrounding code context"),
+            "binary prompt must not include a source-context section");
+    }
+
+    #[test]
+    fn binary_prompt_includes_header_when_provided() {
+        let header = "int compress2(void *dest, unsigned long *destLen, const void *source, unsigned long sourceLen, int level);";
+        let (_, user) = build_binary_prompt("compress2", &[], Some(header));
+        assert!(user.contains(header), "companion header must appear verbatim in the prompt");
+    }
+
+    #[test]
+    fn binary_prompt_extern_c_instruction_when_no_header() {
+        let (_, user) = build_binary_prompt("compress2", &[], None);
+        assert!(user.contains("extern \"C\""),
+            "prompt must instruct AI to use extern \"C\" declaration when no header");
+    }
+
+    #[test]
+    fn binary_prompt_no_extern_c_rule_when_header_provided() {
+        let header = "int compress2(void *dest, unsigned long *destLen);";
+        let (_, user) = build_binary_prompt("compress2", &[], Some(header));
+        // Rule 13 about extern "C" declaration should not appear since header is provided
+        assert!(!user.contains("lives in a pre-built binary and has C linkage"),
+            "extern-C rule must be omitted when header is provided");
+    }
+
+    #[test]
+    fn binary_prompt_requires_llvmfuzzer() {
+        let (_, user) = build_binary_prompt("foo", &[], None);
+        assert!(user.contains("LLVMFuzzerTestOneInput"));
+    }
+
+    #[test]
+    fn binary_prompt_no_posix_headers() {
+        let (_, user) = build_binary_prompt("foo", &[], None);
+        // Must not require POSIX-only headers without a Windows guard
+        assert!(!user.contains("unistd.h") || user.contains("_WIN32"));
     }
 
     #[test]

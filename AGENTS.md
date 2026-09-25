@@ -114,14 +114,14 @@ Run the fuzzer binary (not the reproducer) on the crash file to get the full ASa
 ```
 
 The report tells you the bug class, the exact write address and size, and both stack traces
-(allocation site + overflow site). That determines the exploitation path:
+(allocation site + overflow site). That determines severity and next steps:
 
-| ASan report says | Exploitation path |
+| ASan report says | Severity / exploitability |
 |---|---|
-| `heap-buffer-overflow` | Heap grooming → corrupt adjacent object → write primitive → ROP |
-| `stack-buffer-overflow` | Find offset to saved return address → ROP chain |
-| `heap-use-after-free` | Reclaim freed chunk with controlled data → type confusion |
-| `SEGV on unknown address 0x0` | Null deref — usually not directly exploitable |
+| `heap-buffer-overflow` | High — corrupts adjacent heap state; assess reachability on the target |
+| `stack-buffer-overflow` | High — may reach the saved return address |
+| `heap-use-after-free` | High — type-confusion potential |
+| `SEGV on unknown address 0x0` | Usually a null deref, typically not directly exploitable |
 
 ### 7. Extract ROP gadgets
 
@@ -133,122 +133,36 @@ ROPgadget --binary reproducer --rop --nosys | head -200
 # or: ropper -f reproducer
 ```
 
-### 8. Deep exploitation (iterative agent loop)
+### 8. Multi-stage crashes (iterative loop)
 
-The Guzzle GUI generates a one-shot PoC scaffold. For complex heap vulnerabilities
-(CVE-style, multi-stage primitives) an agent working iteratively will go much further.
-The loop is:
+The GUI's Gen PoC produces a one-shot scaffold. Some crashes (multi-stage heap bugs) need
+iteration before they become a usable PoC. This is reasoning about a **specific crash on a
+target you are authorized to test** — not a generic recipe. The exact adjacent object, field,
+and offsets are all target-specific, so work them against the concrete artifact in front of
+you rather than a canned sequence. The loop:
 
 ```
 read source → understand allocator state → craft input → run → observe → refine
 ```
 
-#### 8a. Map the heap layout from source
+Bring the concrete ASan report and the target source into the loop and iterate from there.
 
-Read the target source and build a picture of what lives on the heap:
-
-- What structs are allocated, in what order, and at what sizes?
-- Which allocations happen before the vulnerable one?
-- Which allocation immediately follows the vulnerable buffer? That's your corruption target.
-- What fields does the target struct contain — function pointers, lengths, pointers to other allocations?
+Useful mechanics for that loop:
 
 ```bash
-# Check allocation sizes for tcache bucket alignment (glibc: round to 16 bytes + 8 header)
-# A malloc(N) lives in the tcache/fastbin for chunk size ceil((N+8)/16)*16
-python3 -c "n=48; print(f'chunk size: {((n+8+15)//16)*16}')"
-```
-
-#### 8b. Inspect heap state at crash time
-
-Compile the reproducer with debug info and run it under a debugger:
-
-```bash
-# Linux — enable core dumps, then examine
-ulimit -c unlimited
-echo 0 | sudo tee /proc/sys/kernel/randomize_va_space
-./reproducer crashes/crash-<hash>   # produces core
-gdb reproducer core
-(gdb) heap chunks      # requires gef/pwndbg
-(gdb) x/32gx <addr>   # inspect raw memory around the overflow
-
-# macOS — use lldb
-lldb -- ./reproducer crashes/crash-<hash>
-(lldb) settings set target.disable-aslr true
-(lldb) run
-(lldb) memory read --size 8 --format x <addr>
-```
-
-Key things to find:
-- What chunk immediately follows the overflow buffer in memory?
-- Is it a struct you control the contents of (e.g. from a previous input field)?
-- Does it contain a length, a pointer, or a function pointer you can redirect?
-
-#### 8c. Craft a grooming sequence
-
-Heap grooming means arranging allocations so the right object lands adjacent to the
-overflow buffer. The general pattern:
-
-1. **Drain the freelist** — allocate enough same-sized chunks to exhaust the tcache/fastbin
-   for the target size, forcing the next allocation to come from the top of the heap
-2. **Allocate the victim** — allocate the object you want to corrupt right after draining
-3. **Allocate the overflow buffer** — now it lands immediately before the victim
-4. **Trigger the overflow** — corrupt exactly the field you identified in 8b
-
-Translate this into input bytes. For a parser like msgparse, each field in the input
-controls one allocation — use multiple TLV records to set up the heap before the
-vulnerable one fires.
-
-Test each grooming attempt:
-
-```bash
-# Write candidate input to a file, run under ASan to observe what gets corrupted
-python3 -c "
-import struct
-# Build a grooming input: several allocations to drain tcache, then the victim
-payload  = b'\\x04' + struct.pack('>H', 48) + b'A'*48   # drain: BLOB 48 bytes
-payload += b'\\x04' + struct.pack('>H', 48) + b'B'*48   # victim: BLOB 48 bytes
-payload += b'\\x01' + struct.pack('>H', 47) + b'C'*47   # overflow: STRING 47 bytes
-open('/tmp/candidate', 'wb').write(payload)
-"
-./fuzzer /tmp/candidate 2>&1 | grep -A5 'heap-buffer-overflow'
-```
-
-Observe the ASan shadow output — it shows which chunk was corrupted. Adjust sizes and
-ordering based on what you see, then repeat.
-
-#### 8d. Turn a write into execution
-
-Once you can reliably corrupt a specific field:
-
-- **Corrupt a length field** → turns a bounded read/write into an unbounded one (second-order primitive)
-- **Corrupt a function pointer** → direct PC control; point at a ROP gadget or shellcode
-- **Corrupt a pointer** → redirect where data is written; aim at GOT/PLT (Linux, no RELRO) or a known writable address
-
-For stack pivot + ROP on Linux (no PIE):
-
-```python
-from pwn import *
-e = ELF('./reproducer')
-rop = ROP(e)
-rop.call('system', [next(e.search(b'/bin/sh\x00'))])
-payload = fit({offset: rop.chain()})
-```
-
-For macOS (PIE, no GOT): leak a heap address from the ASan output or a read primitive,
-calculate the slide, then use gadgets from the radare2 output at `base + gadget_offset`.
-
-#### 8e. Verify and minimise
-
-```bash
-# Confirm the exploit works end-to-end
-python3 exploit.py
-
-# Minimise the crash input (libFuzzer built-in)
+# Minimise the crash input first — smaller input, easier layout to reason about
 ./fuzzer -minimize_crash=1 -exact_artifact_path=crashes/min-<hash> crashes/crash-<hash>
+
+# Inspect memory around the fault under a debugger
+#   Linux: gdb reproducer core   (gef/pwndbg give 'heap chunks', 'x/32gx <addr>')
+#   macOS: lldb -- ./reproducer crashes/crash-<hash>   ('memory read --format x <addr>')
+
+# Disable ASLR for stable addresses while developing
+echo 0 | sudo tee /proc/sys/kernel/randomize_va_space
 ```
 
-A minimised input makes the grooming sequence easier to understand and the PoC easier
-to explain.
+For anything beyond triage, work the concrete crash with the operator — the target-specific
+analysis is where the actual progress happens, and it can't be pre-written here.
 
 ## Tips for agents
 
@@ -257,8 +171,8 @@ to explain.
 - **Seed the corpus**: put small valid inputs in `corpus/` before running — the fuzzer explores much faster
 - **ASLR**: disable for reliable addresses: `echo 0 | sudo tee /proc/sys/kernel/randomize_va_space`
 - **Crash triage**: `AddressSanitizer: heap-buffer-overflow` and `stack-buffer-overflow` are the most exploitable; `SEGV on unknown address 0x0` is usually just a null deref
-- **The GUI Gen PoC is a scaffold**: it gets you the bug class and a starting script; complex heap exploits require the iterative loop in section 8
-- **Iterate on grooming**: wrong chunk size or ordering means you corrupt the wrong object — read the ASan shadow output after each attempt and adjust
+- **The GUI Gen PoC is a scaffold**: it gets you the bug class and a starting script; multi-stage crashes need the iterative loop in section 8, worked against the concrete target
+- **Iterate on the concrete crash**: read the ASan shadow output after each attempt and adjust the input based on what it shows
 - **Minimise before exploiting**: `./fuzzer -minimize_crash=1` strips the crash input to its essential bytes, making the heap layout easier to reason about
 
 ## Fuzzing third-party libraries (e.g. ZNC, OpenSSL, libpng)

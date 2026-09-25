@@ -82,6 +82,13 @@ export const PRESET_PROVIDERS: AiProvider[] = [
   },
 ];
 
+export interface ExportedSymbol {
+  name: string;
+  raw_name: string;
+  symbol_type: string;
+  is_function: boolean;
+}
+
 export type WizardStep =
   | "toolchain"
   | "harness"
@@ -127,6 +134,15 @@ interface SessionState {
   // AI provider
   aiProvider: AiProvider;
 
+  // Binary mode
+  isBinaryMode: boolean;
+  binaryPath: string | null;
+  exportedSymbols: ExportedSymbol[];
+  symbolsLoading: boolean;
+  symbolFilter: string;
+  selectedSymbolName: string | null;
+  companionHeaderContent: string | null;
+
   // Actions
   setFilePath: (path: string, content: string) => void;
   addRecentFile: (path: string) => void;
@@ -152,6 +168,13 @@ interface SessionState {
   setFuzzerTimeoutSecs: (secs: number) => void;
   setFuzzerExtraFlags: (flags: string) => void;
   setAiProvider: (provider: AiProvider) => void;
+
+  setBinaryMode: (active: boolean, path: string | null) => void;
+  setExportedSymbols: (symbols: ExportedSymbol[]) => void;
+  setSymbolsLoading: (v: boolean) => void;
+  setSymbolFilter: (f: string) => void;
+  setSelectedSymbolName: (name: string | null) => void;
+  setCompanionHeaderContent: (content: string | null) => void;
 }
 
 export const useSession = create<SessionState>()(persist((set) => ({
@@ -183,6 +206,14 @@ export const useSession = create<SessionState>()(persist((set) => ({
   fuzzerTimeoutSecs: 60,
   fuzzerExtraFlags: "",
   aiProvider: PRESET_PROVIDERS[0], // DeepSeek by default
+
+  isBinaryMode: false,
+  binaryPath: null,
+  exportedSymbols: [],
+  symbolsLoading: false,
+  symbolFilter: "",
+  selectedSymbolName: null,
+  companionHeaderContent: null,
 
   setFilePath: (path, content) =>
     set({ filePath: path, fileContent: content, selectedLine: null, functionSignature: null, resolvedHeaders: [] }),
@@ -218,7 +249,7 @@ export const useSession = create<SessionState>()(persist((set) => ({
   clearCompileLog: () => set({ compileLog: [] }),
   setFuzzerPid: (pid) => set({ fuzzerPid: pid }),
   appendFuzzerOutput: (line) =>
-    set((s) => ({ fuzzerOutput: [...s.fuzzerOutput.slice(-500), line] })),
+    set((s) => ({ fuzzerOutput: [...s.fuzzerOutput.slice(-499), line] })),
   clearFuzzerOutput: () => set({ fuzzerOutput: [] }),
   setFuzzerStats: (stats) => set({ fuzzerStats: stats ?? null }),
   setCrashes: (crashes) => set({ crashes }),
@@ -226,15 +257,40 @@ export const useSession = create<SessionState>()(persist((set) => ({
   setFuzzerTimeoutSecs: (secs) => set({ fuzzerTimeoutSecs: secs }),
   setFuzzerExtraFlags: (flags) => set({ fuzzerExtraFlags: flags }),
   setAiProvider: (provider) => set({ aiProvider: provider }),
+
+  setBinaryMode: (active, path) => set({
+    isBinaryMode: active,
+    binaryPath: path,
+    exportedSymbols: [],
+    symbolsLoading: false,
+    symbolFilter: "",
+    selectedSymbolName: null,
+    companionHeaderContent: null,
+    harnessSource: "",
+    functionSignature: null,
+  }),
+  setExportedSymbols: (symbols) => set({ exportedSymbols: symbols }),
+  setSymbolsLoading: (v) => set({ symbolsLoading: v }),
+  setSymbolFilter: (f) => set({ symbolFilter: f }),
+  setSelectedSymbolName: (name) => set({ selectedSymbolName: name }),
+  setCompanionHeaderContent: (content) => set({ companionHeaderContent: content }),
 }), {
   name: "guzzle-session",
   // Only persist settings that are painful to re-enter — not transient runtime state
-  partialize: (state) => ({
+  partialize: partializeState,
+}));
+
+/** Exported for unit testing the persistence security properties. */
+export function partializeState(state: SessionState) {
+  return {
     recentFiles: state.recentFiles,
     compileSettings: state.compileSettings,
     fuzzerTimeoutSecs: state.fuzzerTimeoutSecs,
     fuzzerExtraFlags: state.fuzzerExtraFlags,
     // Persist provider config but not the api_key — that lives in the OS keychain
     aiProvider: { ...state.aiProvider, api_key: "" },
-  }),
-}));
+    isBinaryMode: state.isBinaryMode,
+    binaryPath: state.binaryPath,
+    // Do NOT persist exportedSymbols — re-extract from binary on next open
+  };
+}

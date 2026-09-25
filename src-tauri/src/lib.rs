@@ -1,6 +1,6 @@
 mod commands;
 
-use commands::{toolchain, parser, ai, compile, fuzzer, poc, cache, includes};
+use commands::{toolchain, parser, ai, compile, fuzzer, poc, cache, includes, symbols};
 
 #[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
@@ -43,6 +43,8 @@ pub fn run() {
             cache::get_cached_harness,
             cache::save_cached_harness,
             includes::resolve_includes,
+            symbols::extract_symbols,
+            ai::generate_harness_binary,
             reveal_in_finder,
         ])
         .run(tauri::generate_context!())

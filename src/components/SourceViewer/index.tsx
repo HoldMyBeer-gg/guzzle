@@ -8,6 +8,7 @@ export default function SourceViewer() {
   const { fileContent, filePath, functionSignature, setSelectedLine, setFunctionSignature, openWizard } =
     useSession();
   const [detecting, setDetecting] = useState(false);
+  const [parseError, setParseError] = useState<string | null>(null);
   const detectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Always-current ref so the Monaco cursor listener (registered once at mount)
@@ -32,9 +33,10 @@ export default function SourceViewer() {
         try {
           const sig = await parseFunctionAtLine(currentPath, lineNumber);
           setFunctionSignature(sig);
+          setParseError(null);
         } catch (e) {
-          console.error("parse error", e);
           setFunctionSignature(null);
+          setParseError(`Parse error: ${String(e)}`);
         } finally {
           setDetecting(false);
         }
@@ -57,6 +59,11 @@ export default function SourceViewer() {
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
+      {parseError && (
+        <div className="px-4 py-1.5 bg-[#3d1414] border-b border-[#f85149] text-xs text-[#f85149] font-mono">
+          {parseError}
+        </div>
+      )}
       <div className="flex-1 min-h-0">
         <MonacoEditor
           height="100%"
