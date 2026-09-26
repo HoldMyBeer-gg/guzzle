@@ -40,6 +40,7 @@ pub fn run() {
             ai::save_api_key,
             ai::load_api_key,
             poc::generate_poc,
+            poc::triage_crashes,
             cache::get_cached_harness,
             cache::save_cached_harness,
             includes::resolve_includes,
