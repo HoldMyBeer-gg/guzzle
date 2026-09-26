@@ -4,6 +4,10 @@ import type { KeyboardEvent } from "react";
 interface TerminalProps {
   lines: string[];
   className?: string;
+  // When true, the terminal fills its flex parent's height instead of using the
+  // default fixed height — used on the Results screen so the analysis/next-steps
+  // log fills the frame rather than hiding in a short strip.
+  fill?: boolean;
 }
 
 // Color ANSI codes to spans
@@ -49,12 +53,15 @@ function colorize(str: string): React.ReactNode[] {
   return parts.length > 0 ? parts : [<span key={0}>{str}</span>];
 }
 
-export default memo(function Terminal({ lines, className = "" }: TerminalProps) {
+export default memo(function Terminal({ lines, className = "", fill = false }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    // Scroll only THIS container to its bottom. Using scrollIntoView here would
+    // bubble to scroll ancestors and drag the whole panel down (past the log,
+    // onto the script), so set scrollTop directly instead.
+    const el = containerRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [lines]);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
@@ -75,8 +82,8 @@ export default memo(function Terminal({ lines, className = "" }: TerminalProps) 
       ref={containerRef}
       tabIndex={0}
       onKeyDown={handleKeyDown}
-      className={`font-mono text-xs leading-5 overflow-auto bg-[#0d1117] rounded-lg border border-[#30363d] p-3 focus:outline-none focus:ring-1 focus:ring-[#58a6ff] ${className}`}
-      style={{ height: 260 }}
+      className={`font-mono text-xs leading-5 overflow-auto bg-[#0d1117] rounded-lg border border-[#30363d] p-3 focus:outline-none focus:ring-1 focus:ring-[#58a6ff] ${fill ? "h-full min-h-0" : ""} ${className}`}
+      style={fill ? undefined : { height: 260 }}
     >
       {lines.length === 0 ? (
         <span className="text-[#8b949e]">No output yet…</span>
@@ -87,7 +94,6 @@ export default memo(function Terminal({ lines, className = "" }: TerminalProps) 
           </div>
         ))
       )}
-      <div ref={bottomRef} />
     </div>
   );
 });

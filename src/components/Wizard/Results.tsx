@@ -2,9 +2,31 @@ import { useEffect, useState } from "react";
 import MonacoEditor from "@monaco-editor/react";
 import { listen } from "@tauri-apps/api/event";
 import { useSession } from "../../store/session";
-import { readCrashFiles, revealInFinder, generatePoc } from "../../lib/tauri";
+import { readCrashFiles, revealInFinder, generatePoc, triageCrashes } from "../../lib/tauri";
 import type { CrashFile } from "../../store/session";
+import type { CrashVerdict } from "../../lib/tauri";
 import Terminal from "../shared/Terminal";
+
+// Badge + row styling per triage verdict kind. Juicy (control / R/W primitive)
+// is hot red, reachable orange, partial amber, and no-native-crash dimmed.
+function verdictStyle(kind: string): { badge: string; ring: string; dim: boolean } {
+  switch (kind) {
+    case "control":
+    case "primitive":
+      return { badge: "bg-[#f85149]/20 text-[#f85149] border border-[#f85149]/40", ring: "ring-1 ring-[#f85149]/60", dim: false };
+    case "reachable":
+      return { badge: "bg-[#f0883e]/20 text-[#f0883e] border border-[#f0883e]/40", ring: "ring-1 ring-[#f0883e]/50", dim: false };
+    case "partial":
+      return { badge: "bg-[#d29922]/20 text-[#d29922] border border-[#d29922]/40", ring: "ring-1 ring-[#d29922]/40", dim: false };
+    case "deref":
+      return { badge: "bg-[#58a6ff]/15 text-[#58a6ff] border border-[#58a6ff]/30", ring: "", dim: false };
+    case "uncertain":
+      return { badge: "bg-[#8b949e]/15 text-[#8b949e] border border-[#8b949e]/30", ring: "", dim: false };
+    case "none":
+    default:
+      return { badge: "bg-[#30363d] text-[#6e7681] border border-[#30363d]", ring: "", dim: true };
+  }
+}
 
 interface Props {
   onClose: () => void;
@@ -38,7 +60,7 @@ function HexDump({ bytes }: { bytes: number[] }) {
     );
   }
   return (
-    <div className="font-mono text-xs bg-[#0d1117] rounded p-3 max-h-48 overflow-auto">
+    <div className="font-mono text-xs bg-[#0d1117] rounded p-3 max-h-48 overflow-auto flex-shrink-0">
       {lines}
     </div>
   );
@@ -66,6 +88,14 @@ export default function Results({ onClose }: Props) {
   const [loading, setLoading] = useState(true);
   const [crashReadError, setCrashReadError] = useState<string | null>(null);
   const [pocStates, setPocStates] = useState<Record<string, PocState>>({});
+  // Generated script is collapsed by default so the analysis / next-steps log
+  // stays the prominent element on the results screen.
+  const [showScript, setShowScript] = useState(false);
+  // Batch triage verdicts keyed by crash path, plus progress/errors.
+  const [verdicts, setVerdicts] = useState<Record<string, CrashVerdict>>({});
+  const [triaging, setTriaging] = useState(false);
+  const [triageProg, setTriageProg] = useState<{ done: number; total: number } | null>(null);
+  const [triageError, setTriageError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!filePath) return;
@@ -91,6 +121,43 @@ export default function Results({ onClose }: Props) {
   const reproduceCmd = selected
     ? `${compiledBinaryPath ?? "./fuzzer"} ${selected.path}`
     : "";
+
+  const reproducerPath = filePath
+    ? filePath.replace(/[/\\][^/\\]+$/, "") + "/.guzzle/reproducer"
+    : "";
+
+  const handleTriage = async () => {
+    if (!reproducerPath || crashes.length === 0 || triaging) return;
+    setTriaging(true);
+    setTriageError(null);
+    setTriageProg({ done: 0, total: crashes.length });
+    let unlisten: (() => void) | null = null;
+    try {
+      unlisten = await listen<[CrashVerdict, number, number]>("triage_progress", (e) => {
+        const [v, done, total] = e.payload;
+        setVerdicts((prev) => ({ ...prev, [v.crash_path]: v }));
+        setTriageProg({ done, total });
+      });
+      const all = await triageCrashes(reproducerPath, crashes.map((c) => c.path));
+      setVerdicts(Object.fromEntries(all.map((v) => [v.crash_path, v])));
+    } catch (e) {
+      // Surface the failure — the most common cause is "no reproducer yet".
+      setTriageError(String(e));
+    } finally {
+      unlisten?.();
+      setTriaging(false);
+    }
+  };
+
+  const hasVerdicts = Object.keys(verdicts).length > 0;
+  // After triage completes, float the juicy crashes to the top. Keep original
+  // order while triaging so rows don't jump around as verdicts stream in.
+  const displayCrashes =
+    hasVerdicts && !triaging
+      ? [...crashes].sort(
+          (a, b) => (verdicts[b.path]?.severity ?? -1) - (verdicts[a.path]?.severity ?? -1)
+        )
+      : crashes;
 
   const setPocState = (crashPath: string, update: Partial<PocState>) => {
     setPocStates((prev) => ({
@@ -148,7 +215,7 @@ export default function Results({ onClose }: Props) {
   const poc = selected ? (pocStates[selected.path] ?? { status: "idle", log: [], script: null, error: null }) : null;
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-5 h-full min-h-0">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold text-[#e6edf3]">Results</h2>
@@ -185,33 +252,70 @@ export default function Results({ onClose }: Props) {
           </p>
         </div>
       ) : (
-        <div className="flex gap-4" style={{ minHeight: 300 }}>
+        <div className="flex gap-4 flex-1 min-h-0" style={{ minHeight: 300 }}>
           {/* Crash list */}
-          <div className="w-48 flex-shrink-0 flex flex-col gap-1 overflow-y-auto" style={{ maxHeight: 400 }}>
-            <p className="text-xs text-[#8b949e] uppercase tracking-wider mb-1 sticky top-0 bg-[#0d1117]">Crashes</p>
-            {crashes.map((c) => (
-              <button
-                key={c.path}
-                onClick={() => setSelected(c)}
-                className={`text-left px-3 py-2 rounded-md text-xs font-mono truncate transition-colors flex-shrink-0 ${
-                  selected?.path === c.path
-                    ? "bg-[#30363d] text-[#e6edf3]"
-                    : "text-[#8b949e] hover:bg-[#21262d]"
-                }`}
-              >
-                {c.path.split(/[/\\]/).pop()}
-                <span className="block text-[10px] text-[#8b949e]">{c.size}B · {timeAgo(c.modified_secs)}</span>
-              </button>
-            ))}
+          <div className="w-60 flex-shrink-0 flex flex-col gap-1 overflow-y-auto min-h-0">
+            <div className="sticky top-0 bg-[#0d1117] pb-1 flex flex-col gap-1.5">
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-[#8b949e] uppercase tracking-wider">Crashes</p>
+                <button
+                  onClick={handleTriage}
+                  disabled={triaging || crashes.length === 0}
+                  className="text-[10px] px-2 py-1 rounded bg-[#21262d] hover:bg-[#30363d] border border-[#30363d] text-[#e6edf3] transition-colors disabled:opacity-40 flex items-center gap-1"
+                  title="Run the clean reproducer over every crash and rank by exploitability"
+                >
+                  {triaging && (
+                    <span className="w-2.5 h-2.5 border-2 border-[#58a6ff] border-t-transparent rounded-full animate-spin" />
+                  )}
+                  {triaging
+                    ? `Triaging ${triageProg?.done ?? 0}/${triageProg?.total ?? 0}`
+                    : hasVerdicts
+                    ? "Re-triage"
+                    : "Triage all"}
+                </button>
+              </div>
+              {triageError && (
+                <p className="text-[10px] text-[#f0883e] leading-tight">{triageError}</p>
+              )}
+            </div>
+            {displayCrashes.map((c) => {
+              const v = verdicts[c.path];
+              const style = v ? verdictStyle(v.kind) : null;
+              const isSel = selected?.path === c.path;
+              return (
+                <button
+                  key={c.path}
+                  onClick={() => setSelected(c)}
+                  title={v?.headline}
+                  className={`text-left px-3 py-2 rounded-md text-xs font-mono truncate transition-colors flex-shrink-0 ${
+                    style?.ring ?? ""
+                  } ${style?.dim ? "opacity-50" : ""} ${
+                    isSel
+                      ? "bg-[#30363d] text-[#e6edf3]"
+                      : "text-[#8b949e] hover:bg-[#21262d]"
+                  }`}
+                >
+                  {c.path.split(/[/\\]/).pop()}
+                  <span className="flex items-center justify-between gap-2 mt-0.5">
+                    <span className="text-[10px] text-[#8b949e]">{c.size}B · {timeAgo(c.modified_secs)}</span>
+                    {v && (
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded font-sans whitespace-nowrap ${style!.badge}`}>
+                        {v.label}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              );
+            })}
           </div>
 
           {/* Crash detail */}
-          <div className="flex-1 flex flex-col gap-3 min-w-0">
+          <div className="flex-1 flex flex-col gap-3 min-w-0 min-h-0 overflow-y-auto">
             {selected ? (
               <>
                 <HexDump bytes={selected.preview_bytes} />
 
-                <div>
+                <div className="flex-shrink-0">
                   <p className="text-xs text-[#8b949e] mb-1">Reproduce command:</p>
                   <code className="block bg-[#21262d] rounded p-2 text-xs font-mono text-[#e6edf3] break-all">
                     {reproduceCmd}
@@ -219,7 +323,7 @@ export default function Results({ onClose }: Props) {
                 </div>
 
                 {/* Gen PoC button */}
-                <div className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1.5 flex-shrink-0">
                   <div className="flex items-center gap-3">
                     <button
                       onClick={() => handleGenPoc(selected)}
@@ -240,9 +344,19 @@ export default function Results({ onClose }: Props) {
                   </p>
                 </div>
 
-                {/* PoC progress log */}
+                {/* PoC progress log — the control-flow verdict and the staged
+                    NEXT STEPS land here, so make it fill the frame and label it
+                    plainly (it's easy to miss as a "log"). */}
                 {poc && poc.log.length > 0 && (
-                  <Terminal lines={poc.log} className="max-h-52" />
+                  <div className="flex-1 min-h-[240px] flex flex-col gap-1">
+                    <p className="text-xs text-[#e6edf3] font-medium">
+                      Analysis &amp; next steps{" "}
+                      <span className="text-[#8b949e] font-normal">
+                        — the control-flow verdict and exploitation plan are in here, read them:
+                      </span>
+                    </p>
+                    <Terminal lines={poc.log} fill className="flex-1 min-h-0" />
+                  </div>
                 )}
 
                 {/* PoC error */}
@@ -260,18 +374,28 @@ export default function Results({ onClose }: Props) {
                   </div>
                 )}
 
-                {/* Generated PoC script */}
+                {/* Generated PoC script — collapsed by default so the analysis /
+                    next-steps log above stays the prominent element. */}
                 {poc?.status === "done" && poc.script && (
-                  <div className="flex flex-col gap-2">
+                  <div className="flex flex-col gap-2 flex-shrink-0">
                     <div className="flex items-center justify-between">
-                      <p className="text-xs text-[#8b949e]">Generated pwntools script:</p>
                       <button
-                        onClick={() => copyScript(poc.script!)}
-                        className="text-xs text-[#58a6ff] hover:underline"
+                        onClick={() => setShowScript((s) => !s)}
+                        className="text-xs text-[#58a6ff] hover:underline flex items-center gap-1"
                       >
-                        Copy
+                        <span>{showScript ? "▾" : "▸"}</span>
+                        {showScript ? "Hide" : "Show"} generated pwntools script
                       </button>
+                      {showScript && (
+                        <button
+                          onClick={() => copyScript(poc.script!)}
+                          className="text-xs text-[#58a6ff] hover:underline"
+                        >
+                          Copy
+                        </button>
+                      )}
                     </div>
+                    {showScript && (
                     <div className="rounded-lg overflow-hidden border border-[#30363d]">
                       <MonacoEditor
                         height="300px"
@@ -287,6 +411,8 @@ export default function Results({ onClose }: Props) {
                         }}
                       />
                     </div>
+                    )}
+                    {showScript && (
                     <div className="bg-[#161b22] border border-[#30363d] rounded-md p-3 flex flex-col gap-2 text-[11px] text-[#8b949e]">
                       <p className="text-[#e6edf3] font-semibold">How to use this script</p>
                       <ol className="flex flex-col gap-1.5 list-decimal list-inside">
@@ -304,6 +430,7 @@ export default function Results({ onClose }: Props) {
                       </p>
                       <p>Most useful for <span className="text-[#e6edf3]">stack-buffer-overflow</span>. Heap/UAF/double-free won't yield a traditional ROP chain. Offsets and libc addresses usually need manual tuning.</p>
                     </div>
+                    )}
                   </div>
                 )}
               </>

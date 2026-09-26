@@ -123,3 +123,22 @@ export async function generatePoc(args: {
 }): Promise<string> {
   return invoke("generate_poc", args);
 }
+
+export interface CrashVerdict {
+  crash_path: string;
+  // control | primitive | reachable | partial | deref | uncertain | none | error
+  kind: string;
+  severity: number; // 0 (dim) … 5 (juicy)
+  label: string;
+  headline: string;
+}
+
+// Batch-triage every crash against an already-built reproducer. Streams a
+// `triage_progress` event ([verdict, done, total]) per crash and returns the
+// full list.
+export async function triageCrashes(
+  reproducerPath: string,
+  crashPaths: string[]
+): Promise<CrashVerdict[]> {
+  return invoke("triage_crashes", { reproducerPath, crashPaths });
+}

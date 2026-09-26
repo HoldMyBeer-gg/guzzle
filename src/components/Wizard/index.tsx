@@ -37,10 +37,9 @@ export default function Wizard() {
   const goTo = (step: typeof wizardStep) => setWizardStep(step);
 
   return (
-    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-3 sm:p-5">
       <div
-        className="bg-[#161b22] border border-[#30363d] rounded-xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[90vh]"
-        style={{ minHeight: 520 }}
+        className="bg-[#161b22] border border-[#30363d] rounded-xl shadow-2xl w-full max-w-[1600px] h-[92vh] flex flex-col"
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#30363d]">
