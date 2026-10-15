@@ -159,6 +159,44 @@ Requirements:
     linkage and CANNOT be called from the harness — no exported symbol exists.
     Do NOT forward-declare it and do NOT call it. Call the public (non-static)
     function in the same file that invokes it internally.
+
+13. The TARGET (not the harness) may terminate the whole process on error —
+    directly via `exit`/`_exit`/`abort`/`quick_exit`/`err`/`errx`, or via a
+    project-specific death function (names like `Die*`, `die_*`, `fatal*`,
+    `panic*`, `*_usage`, `bail*`). libFuzzer treats any such call as a fatal
+    crash and stops the whole run, so a target whose error paths terminate is
+    unfuzzable as-is. When the context shows the target or its callees can do
+    this:
+      - Wrap the call to the target in a `setjmp` guard and `return 0` on the
+        longjmp-back path:
+          static jmp_buf guzzle_return;
+          if (setjmp(guzzle_return)) return 0;   // target terminated; skip input
+      - For each project-specific death function VISIBLE in the context (e.g.
+        `DieWithBadArg`), define your own replacement in the harness that calls
+        `longjmp(guzzle_return, 1)` instead of exiting, so the fuzzer stays
+        alive to explore other paths. (Do not attempt to redefine libc `exit`
+        itself; assume the build wraps those.)
+
+14. Reproduce caller-guaranteed invariants for any structure you fabricate. If
+    the real caller normally guarantees a shape the target relies on, you must
+    reproduce it or you manufacture a false crash:
+      - For `char **argv` / `int argc`: allocate `argc + 1` pointer slots and set
+        `argv[argc] = NULL`. Parsers routinely read `argv[i+1]` after checking
+        `argv[i+1] == NULL`, relying on `argv[argc] == NULL`.
+      - For sentinel-terminated lists, write the sentinel; for paired
+        length+buffer arguments, pass a length that matches the buffer you built.
+
+15. Do NOT cap synthesized string or array lengths at a small constant. Small
+    caps (e.g. `ConsumeRandomLengthString(32)`) prevent the fuzzer from reaching
+    overflow sinks. Size synthesized inputs to at least the largest fixed buffer
+    visible in the context; when the size is unknown, default generously (e.g.
+    4096) so `strcpy`/`memcpy`-into-fixed-buffer bugs are reachable.
+
+16. Prefer real types over opaque stubs. If the context or a listed header
+    defines a parameter's type, include that definition and use the real type.
+    Only fall back to an opaque byte-buffer stub (`unsigned char storage[N]`)
+    when no definition is available anywhere in context — and if you must stub,
+    size it generously to avoid under-allocating a struct that grows.
 {include_rule}
 Return ONLY the C/C++ source code, no markdown fences."#,
         func_name = signature.name,
@@ -170,7 +208,7 @@ Return ONLY the C/C++ source code, no markdown fences."#,
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
-                "\n13. The following system headers were confirmed to exist on this machine — \
+                "\n17. The following system headers were confirmed to exist on this machine — \
                 you MAY use #include <...> for any of them:\n{list}\n    \
                 Do NOT #include library headers that are not in this list."
             )
@@ -204,7 +242,7 @@ fn build_binary_prompt(
     };
 
     let extern_c_rule = if companion_header.is_none() {
-        "\n13. Declare the target function with `extern \"C\"` before calling it — \
+        "\n16. Declare the target function with `extern \"C\"` before calling it — \
              it lives in a pre-built binary and has C linkage."
             .to_string()
     } else {
@@ -252,7 +290,25 @@ Requirements:
     copy every `#define` from it verbatim into the harness before any use.
 
 12. Do NOT include any source-context section — this is a pre-built binary with
-    no source available.{extern_c_rule}
+    no source available.
+
+13. The TARGET may terminate the process on error (`exit`/`abort`/`err` or a
+    project-specific death function). libFuzzer treats that as a fatal crash and
+    stops the run. Wrap the call to the target in a `setjmp` guard and return 0
+    on the longjmp-back path so a terminating input does not kill the campaign:
+      static jmp_buf guzzle_return;
+      if (setjmp(guzzle_return)) return 0;
+    (Do not redefine libc `exit` yourself; assume the build wraps terminators.)
+
+14. Reproduce caller-guaranteed invariants for structures you fabricate. For
+    `char **argv` / `int argc`, allocate `argc + 1` slots and set
+    `argv[argc] = NULL` — parsers read `argv[i+1]` relying on that terminator.
+    For sentinel lists write the sentinel; for length+buffer pairs pass a length
+    matching the buffer.
+
+15. Do NOT cap synthesized string or array lengths at a small constant — that
+    prevents reaching overflow sinks. Default generously (e.g. 4096) so
+    fixed-buffer overflow bugs are reachable.{extern_c_rule}
 {include_rule}
 Return ONLY the C/C++ source code, no markdown fences."#,
         include_rule = if include_hints.is_empty() {
@@ -262,7 +318,7 @@ Return ONLY the C/C++ source code, no markdown fences."#,
                 .map(|h| format!("   <{h}>"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let rule_num = if companion_header.is_none() { 14 } else { 13 };
+            let rule_num = if companion_header.is_none() { 17 } else { 16 };
             format!(
                 "\n{rule_num}. The following system headers were confirmed to exist on this machine — \
                 you MAY use #include <...> for any of them:\n{list}\n    \
@@ -649,6 +705,77 @@ mod tests {
         let (_, user) = build_binary_prompt("foo", &[], None);
         // Must not require POSIX-only headers without a Windows guard
         assert!(!user.contains("unistd.h") || user.contains("_WIN32"));
+    }
+
+    #[test]
+    fn build_prompt_handles_target_side_terminators() {
+        let sig = dummy_sig("parse_command_line");
+        let (_, user) = build_prompt(&sig, "// context", &[]);
+        // Gap 1: the target calling exit()/Die*() must be guarded, not just the harness.
+        assert!(user.contains("setjmp") && user.contains("longjmp"),
+            "prompt must instruct a setjmp/longjmp guard around a terminating target");
+        assert!(user.contains("Die") && user.contains("exit"),
+            "prompt must name process terminators including project-specific death functions");
+    }
+
+    #[test]
+    fn build_prompt_requires_argv_null_termination() {
+        let sig = dummy_sig("parse_command_line");
+        let (_, user) = build_prompt(&sig, "", &[]);
+        // Gap 2: fabricated argv must be NULL-terminated to avoid manufactured crashes.
+        assert!(user.contains("argv[argc] = NULL"),
+            "prompt must require NULL-terminating fabricated argv");
+        assert!(user.contains("argc + 1"),
+            "prompt must require allocating argc + 1 pointer slots");
+    }
+
+    #[test]
+    fn build_prompt_forbids_small_length_caps() {
+        let sig = dummy_sig("foo");
+        let (_, user) = build_prompt(&sig, "", &[]);
+        // Gap 3: small length caps keep the fuzzer from reaching overflow sinks.
+        assert!(user.contains("Do NOT cap synthesized string"),
+            "prompt must forbid capping synthesized lengths at a small constant");
+        assert!(user.contains("largest fixed buffer"),
+            "prompt must instruct sizing inputs to the largest visible buffer");
+    }
+
+    #[test]
+    fn build_prompt_prefers_real_types_over_stubs() {
+        let sig = dummy_sig("foo");
+        let (_, user) = build_prompt(&sig, "", &[]);
+        assert!(user.contains("Prefer real types over opaque stubs"),
+            "prompt must prefer real type definitions over opaque byte-buffer stubs");
+    }
+
+    #[test]
+    fn binary_prompt_handles_terminators_and_invariants() {
+        let (_, user) = build_binary_prompt("parse_command_line", &[], None);
+        assert!(user.contains("setjmp"),
+            "binary prompt must guard a terminating target with setjmp");
+        assert!(user.contains("argv[argc] = NULL"),
+            "binary prompt must require NULL-terminating fabricated argv");
+        assert!(user.contains("Do NOT cap synthesized string"),
+            "binary prompt must forbid small length caps");
+    }
+
+    #[test]
+    fn binary_prompt_rule_numbers_stay_sequential_without_header() {
+        let (_, user) = build_binary_prompt("foo", &["zlib.h".to_string()], None);
+        // Without a header: extern-C is 16, include-hint rule is 17.
+        assert!(user.contains("\n16. Declare the target function"),
+            "extern-C rule must be numbered 16 when no header is provided");
+        assert!(user.contains("17. The following system headers"),
+            "include-hint rule must be numbered 17 when no header is provided");
+    }
+
+    #[test]
+    fn binary_prompt_rule_numbers_stay_sequential_with_header() {
+        let hdr = "int foo(int argc, char **argv);";
+        let (_, user) = build_binary_prompt("foo", &["zlib.h".to_string()], Some(hdr));
+        // With a header: no extern-C rule, include-hint rule is 16.
+        assert!(user.contains("16. The following system headers"),
+            "include-hint rule must be numbered 16 when a header is provided");
     }
 
     #[test]
