@@ -3,6 +3,7 @@ import MonacoEditor from "@monaco-editor/react";
 import { listen } from "@tauri-apps/api/event";
 import { useSession } from "../../store/session";
 import { readCrashFiles, revealInFinder, generatePoc } from "../../lib/tauri";
+import { pocResultToState } from "../../lib/poc";
 import type { CrashFile } from "../../store/session";
 import Terminal from "../shared/Terminal";
 
@@ -45,10 +46,11 @@ function HexDump({ bytes }: { bytes: number[] }) {
 }
 
 interface PocState {
-  status: "idle" | "running" | "done" | "error";
+  status: "idle" | "running" | "done" | "error" | "not_exploitable";
   log: string[];
   script: string | null;
   error: string | null;
+  verdict: string | null;
 }
 
 export default function Results({ onClose }: Props) {
@@ -95,13 +97,13 @@ export default function Results({ onClose }: Props) {
   const setPocState = (crashPath: string, update: Partial<PocState>) => {
     setPocStates((prev) => ({
       ...prev,
-      [crashPath]: { ...(prev[crashPath] ?? { status: "idle", log: [], script: null, error: null }), ...update },
+      [crashPath]: { ...(prev[crashPath] ?? { status: "idle", log: [], script: null, error: null, verdict: null }), ...update },
     }));
   };
 
   const appendPocLog = (crashPath: string, line: string) => {
     setPocStates((prev) => {
-      const cur = prev[crashPath] ?? { status: "idle", log: [], script: null, error: null };
+      const cur = prev[crashPath] ?? { status: "idle", log: [], script: null, error: null, verdict: null };
       return { ...prev, [crashPath]: { ...cur, log: [...cur.log, line] } };
     });
   };
@@ -112,7 +114,7 @@ export default function Results({ onClose }: Props) {
     const isHeader = /\.(h|hpp)$/i.test(filePath);
     const targetFiles = isHeader ? [] : [filePath];
 
-    setPocState(crash.path, { status: "running", log: [], script: null, error: null });
+    setPocState(crash.path, { status: "running", log: [], script: null, error: null, verdict: null });
 
     let unlisten: (() => void) | null = null;
     try {
@@ -120,7 +122,7 @@ export default function Results({ onClose }: Props) {
         appendPocLog(crash.path, e.payload);
       });
 
-      const script = await generatePoc({
+      const result = await generatePoc({
         crashPath: crash.path,
         harnessSource,
         targetFiles,
@@ -131,7 +133,7 @@ export default function Results({ onClose }: Props) {
         functionSignature,
       });
 
-      setPocState(crash.path, { status: "done", script });
+      setPocState(crash.path, pocResultToState(result));
     } catch (e) {
       const msg = String(e);
       setPocState(crash.path, { status: "error", error: msg });
@@ -145,7 +147,7 @@ export default function Results({ onClose }: Props) {
     navigator.clipboard.writeText(script).catch(() => {});
   };
 
-  const poc = selected ? (pocStates[selected.path] ?? { status: "idle", log: [], script: null, error: null }) : null;
+  const poc = selected ? (pocStates[selected.path] ?? { status: "idle", log: [], script: null, error: null, verdict: null }) : null;
 
   return (
     <div className="flex flex-col gap-5">
@@ -257,6 +259,14 @@ export default function Results({ onClose }: Props) {
                     ) : (
                       poc.error
                     )}
+                  </div>
+                )}
+
+                {/* Not-exploitable verdict — a clean result, not a failure */}
+                {poc?.status === "not_exploitable" && poc.verdict && (
+                  <div className="bg-[#2d2206] border border-[#9e6a03] rounded-md p-3 text-xs text-[#d29922] whitespace-pre-wrap">
+                    <p className="font-semibold mb-1">Not exploitable — crash did not reproduce</p>
+                    <p>{poc.verdict}</p>
                   </div>
                 )}
 

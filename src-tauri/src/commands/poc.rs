@@ -124,6 +124,68 @@ fn detect_bug_class(asan_report: &str) -> BugClass {
     }
 }
 
+/// Outcome of running the sanitizer-free reproducer against the crash input.
+/// This is the triage gate: only a genuine native crash is worth taking to the
+/// ROP/pwntools exploit stage — a clean or non-crashing exit is not.
+#[derive(Debug, PartialEq, Eq)]
+enum ReproOutcome {
+    /// Killed by a terminating signal (Unix) or an exception status (Windows) —
+    /// a real native crash. Proceed to the exploit path.
+    Crashed,
+    /// Exited 0: the target ran to completion. Any bug here was only catchable
+    /// by ASan, not a native fault — not (yet) exploitable, skip.
+    CleanExit,
+    /// Non-zero exit with no crash signal: the reproducer harness bailed (bad
+    /// crash file, read error) rather than the target crashing. Not reproduced.
+    NonCrashExit,
+}
+
+impl ReproOutcome {
+    /// Whether this outcome represents a genuine crash worth exploiting.
+    fn is_crash(&self) -> bool {
+        matches!(self, ReproOutcome::Crashed)
+    }
+}
+
+/// Classify a reproducer run from its terminating signal and exit code.
+///
+/// `signal` is the terminating signal number on Unix (`None` on Windows or when
+/// the process exited normally); `code` is the normal exit code when present.
+#[cfg(unix)]
+fn classify_repro(signal: Option<i32>, code: Option<i32>) -> ReproOutcome {
+    if signal.is_some() {
+        ReproOutcome::Crashed
+    } else if code == Some(0) {
+        ReproOutcome::CleanExit
+    } else {
+        ReproOutcome::NonCrashExit
+    }
+}
+
+/// Windows has no signals; a crash surfaces as an NTSTATUS exception code in the
+/// exit code (high bit set, e.g. `0xC0000005` access violation, `0xC000001D`
+/// illegal instruction).
+#[cfg(windows)]
+fn classify_repro(_signal: Option<i32>, code: Option<i32>) -> ReproOutcome {
+    match code {
+        Some(0) => ReproOutcome::CleanExit,
+        Some(c) if (c as u32) >= 0xC000_0000 => ReproOutcome::Crashed,
+        _ => ReproOutcome::NonCrashExit,
+    }
+}
+
+/// Result of a PoC attempt. A crash that doesn't reproduce on the
+/// sanitizer-free binary is a legitimate *verdict*, not an error — the UI
+/// should present it as "not exploitable" rather than a red failure.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PocResult {
+    /// A reproducing crash; `script` is the generated pwntools exploit.
+    Script { script: String },
+    /// The crash did not reproduce natively; `reason` explains the verdict.
+    NotExploitable { reason: String },
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_poc(
@@ -136,7 +198,7 @@ pub async fn generate_poc(
     clang_override: Option<String>,
     provider: AiProvider,
     function_signature: FunctionSignature,
-) -> Result<String, String> {
+) -> Result<PocResult, String> {
     // ── Step 1: Check for ROP tool ──────────────────────────────────────────
     emit(&app, "[ 1/5 ] Checking for ROP gadget tool…");
     let rop_tool = find_rop_tool().ok_or_else(|| {
@@ -391,25 +453,53 @@ pub async fn generate_poc(
     emit(&app, format!("      Run it as: {} <crash_file>", reproducer_path.display()));
 
     // ── Step 5: Verify crash reproduces ──────────────────────────────────────
+    // Triage gate: the reproducer is built WITHOUT sanitizers, so only a genuine
+    // native fault (a terminating signal on Unix / exception status on Windows)
+    // counts as reproduced. An exit 0 means the bug was ASan-only; a non-zero
+    // non-crash exit means the harness bailed. Neither is worth the exploit path,
+    // so we stop here rather than hand the AI a crash that doesn't exist.
     emit(&app, "[ 5/6 ] Verifying crash reproduces…");
     let verify = Command::new(reproducer_path.to_str().unwrap())
         .arg(&crash_path)
         .current_dir(&temp_dir)
         .output();
 
-    match verify {
-        Ok(out) => {
-            let code = out.status.code().unwrap_or(-1);
-            if out.status.success() {
-                emit(&app, "      WARNING: reproducer exited 0 — crash may not reproduce on clean binary.");
-                emit(&app, "      (This is expected if the overflow is only caught by ASan, not a native SIGSEGV.)");
-            } else {
-                emit(&app, format!("      Crash reproduced (exit code {code}) ✓"));
+    let out = verify.map_err(|e| {
+        format!("Could not run reproducer to verify the crash: {e}. Aborting — cannot confirm the crash is real.")
+    })?;
+
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        out.status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+
+    let code = out.status.code();
+    let outcome = classify_repro(signal, code);
+    if outcome.is_crash() {
+        let how = signal
+            .map(|s| format!("signal {s}"))
+            .or_else(|| code.map(|c| format!("exit 0x{:08X}", c as u32)))
+            .unwrap_or_else(|| "abnormal termination".into());
+        emit(&app, format!("      Crash reproduced on sanitizer-free binary ({how}) ✓"));
+    } else {
+        let reason = match outcome {
+            ReproOutcome::CleanExit =>
+                "The sanitizer-free reproducer exited cleanly (0). This crash was an \
+                 ASan-only catch, not a native fault — not exploitable as-is."
+                    .to_string(),
+            _ => {
+                let code = code.unwrap_or(-1);
+                format!(
+                    "The reproducer exited {code} with no crash signal (likely a harness or \
+                     crash-file problem, not a native fault) — the crash did not reproduce."
+                )
             }
-        }
-        Err(e) => {
-            emit(&app, format!("      WARNING: Could not run reproducer: {e}"));
-        }
+        };
+        emit(&app, format!("      Verdict: not exploitable — {reason}"));
+        return Ok(PocResult::NotExploitable { reason });
     }
 
     // ── Step 6: Extract ROP gadgets ──────────────────────────────────────────
@@ -608,7 +698,7 @@ Return ONLY the Python3 source code, no markdown fences."#,
     let script = call_ai(&provider, system, user).await?;
     emit(&app, "      PoC script generated ✓");
 
-    Ok(script)
+    Ok(PocResult::Script { script })
 }
 
 #[cfg(test)]
@@ -700,5 +790,52 @@ mod tests {
             current_dir_pos.map_or(false, |p| p < output_pos),
             "reproducer verify Command must set current_dir before .output()"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_repro_unix_signal_is_crash() {
+        // Killed by SIGSEGV / SIGABRT / SIGBUS → genuine native crash.
+        assert_eq!(classify_repro(Some(11), None), ReproOutcome::Crashed);
+        assert_eq!(classify_repro(Some(6), None), ReproOutcome::Crashed);
+        assert_eq!(classify_repro(Some(10), None), ReproOutcome::Crashed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_repro_unix_exit_zero_is_clean() {
+        // Ran to completion with 0 → only ASan would have caught it. Not a crash.
+        assert_eq!(classify_repro(None, Some(0)), ReproOutcome::CleanExit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_repro_unix_nonzero_exit_is_not_crash() {
+        // Non-zero exit with no signal = harness/file problem, not a reproduced crash.
+        assert_eq!(classify_repro(None, Some(1)), ReproOutcome::NonCrashExit);
+        assert_eq!(classify_repro(None, None), ReproOutcome::NonCrashExit);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_repro_windows_exception_code_is_crash() {
+        // No signals on Windows; a crash surfaces as an NTSTATUS exception code
+        // with the high bit set, e.g. 0xC0000005 (access violation).
+        assert_eq!(classify_repro(None, Some(0xC0000005u32 as i32)), ReproOutcome::Crashed);
+        assert_eq!(classify_repro(None, Some(0xC000001Du32 as i32)), ReproOutcome::Crashed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_repro_windows_clean_and_benign() {
+        assert_eq!(classify_repro(None, Some(0)), ReproOutcome::CleanExit);
+        assert_eq!(classify_repro(None, Some(1)), ReproOutcome::NonCrashExit);
+    }
+
+    #[test]
+    fn only_crashed_outcome_proceeds_to_exploit() {
+        assert!(ReproOutcome::Crashed.is_crash());
+        assert!(!ReproOutcome::CleanExit.is_crash());
+        assert!(!ReproOutcome::NonCrashExit.is_crash());
     }
 }

@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { PocResult } from "./poc";
+export type { PocResult };
 import type {
   FunctionSignature,
   ToolchainInfo,
@@ -120,6 +122,6 @@ export async function generatePoc(args: {
   clangOverride?: string;
   provider: AiProvider;
   functionSignature: FunctionSignature;
-}): Promise<string> {
+}): Promise<PocResult> {
   return invoke("generate_poc", args);
 }
