@@ -76,7 +76,6 @@ export default memo(function Terminal({ lines, className = "" }: TerminalProps) 
       tabIndex={0}
       onKeyDown={handleKeyDown}
       className={`font-mono text-xs leading-5 overflow-auto bg-[#0d1117] rounded-lg border border-[#30363d] p-3 focus:outline-none focus:ring-1 focus:ring-[#58a6ff] ${className}`}
-      style={{ height: 260 }}
     >
       {lines.length === 0 ? (
         <span className="text-[#8b949e]">No output yet…</span>

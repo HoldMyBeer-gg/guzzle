@@ -186,7 +186,7 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
   const needsApiKey = provider.name !== "ollama";
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4 h-full">
       <div>
         <h2 className="text-lg font-semibold text-[#e6edf3]">Harness Editor</h2>
         <p className="text-sm text-[#8b949e] mt-1">
@@ -328,7 +328,7 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
         </div>
       )}
 
-      <div className="rounded-lg overflow-hidden border border-[#30363d]" style={{ height: 280 }}>
+      <div className="rounded-lg overflow-hidden border border-[#30363d] flex-1 min-h-0" style={{ minHeight: 280 }}>
         {(cacheChecking || harnessGenerating) && !harnessSource ? (
           <div className="flex items-center justify-center h-full bg-[#0d1117] gap-3">
             <div className="w-5 h-5 border-2 border-[#58a6ff] border-t-transparent rounded-full animate-spin" />
@@ -338,7 +338,7 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
           </div>
         ) : (
           <MonacoEditor
-            height="280px"
+            height="100%"
             language="cpp"
             value={harnessSource}
             theme="vs-dark"

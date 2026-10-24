@@ -117,7 +117,7 @@ export default function CompileSettings({ onBack, onNext }: Props) {
   };
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-5 h-full">
       <div>
         <h2 className="text-lg font-semibold text-[#e6edf3]">Compile Settings</h2>
         <p className="text-sm text-[#8b949e] mt-1">
@@ -229,7 +229,7 @@ export default function CompileSettings({ onBack, onNext }: Props) {
 
       {/* Compile output */}
       {compileLog.length > 0 && (
-        <Terminal lines={compileLog} className="max-h-40" />
+        <Terminal lines={compileLog} className="h-40" />
       )}
 
       {compileError && (

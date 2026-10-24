@@ -150,7 +150,7 @@ export default function Results({ onClose }: Props) {
   const poc = selected ? (pocStates[selected.path] ?? { status: "idle", log: [], script: null, error: null, verdict: null }) : null;
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-5 h-full">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold text-[#e6edf3]">Results</h2>
@@ -187,9 +187,9 @@ export default function Results({ onClose }: Props) {
           </p>
         </div>
       ) : (
-        <div className="flex gap-4" style={{ minHeight: 300 }}>
+        <div className="flex gap-4 flex-1 min-h-0" style={{ minHeight: 300 }}>
           {/* Crash list */}
-          <div className="w-48 flex-shrink-0 flex flex-col gap-1 overflow-y-auto" style={{ maxHeight: 400 }}>
+          <div className="w-48 flex-shrink-0 flex flex-col gap-1 overflow-y-auto min-h-0">
             <p className="text-xs text-[#8b949e] uppercase tracking-wider mb-1 sticky top-0 bg-[#0d1117]">Crashes</p>
             {crashes.map((c) => (
               <button
@@ -208,7 +208,7 @@ export default function Results({ onClose }: Props) {
           </div>
 
           {/* Crash detail */}
-          <div className="flex-1 flex flex-col gap-3 min-w-0">
+          <div className="flex-1 flex flex-col gap-3 min-w-0 overflow-y-auto min-h-0">
             {selected ? (
               <>
                 <HexDump bytes={selected.preview_bytes} />
@@ -244,7 +244,7 @@ export default function Results({ onClose }: Props) {
 
                 {/* PoC progress log */}
                 {poc && poc.log.length > 0 && (
-                  <Terminal lines={poc.log} className="max-h-52" />
+                  <Terminal lines={poc.log} className="h-52" />
                 )}
 
                 {/* PoC error */}

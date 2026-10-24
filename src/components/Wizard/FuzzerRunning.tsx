@@ -153,7 +153,7 @@ export default function FuzzerRunning({ onBack, onNext }: Props) {
   };
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4 h-full">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold text-[#e6edf3]">Fuzzer Running</h2>
@@ -225,7 +225,7 @@ export default function FuzzerRunning({ onBack, onNext }: Props) {
         <button onClick={crashes.length > 0 ? onNext : undefined} className="underline text-xs">View results →</button>
       </div>
 
-      <Terminal lines={fuzzerOutput} />
+      <Terminal lines={fuzzerOutput} className="flex-1 min-h-0" />
 
       <div className="flex justify-between">
         <button
