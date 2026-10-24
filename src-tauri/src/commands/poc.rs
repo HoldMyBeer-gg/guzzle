@@ -73,6 +73,22 @@ fn rop_tool_name(tool: &RopTool) -> &'static str {
     }
 }
 
+/// Max gadget lines kept from the tool output (size guard for the AI prompt).
+const GADGET_LINE_CAP: usize = 400;
+
+/// radare2 command script for gadget extraction.
+///
+/// r2 6.x replaced `/R` with the architecture-aware `/g` family: `/gR` return
+/// gadgets (classic ROP), `/gJ` jump gadgets (`br`), `/gC` call gadgets
+/// (`bl`/`blr`). Jump and call gadgets are the JOP primitives that matter on
+/// arm64, where `ret` gadgets are comparatively scarce. `?e` prints a section
+/// label. The trailing `/R` keeps pre-6.x r2 working — whichever command the
+/// installed r2 doesn't know simply errors to stderr. No `aaa`: gadget search is
+/// a linear byte scan, and full analysis is slow on large binaries.
+fn r2_gadget_script() -> &'static str {
+    "?e [RET gadgets]; /gR; ?e [JUMP gadgets]; /gJ; ?e [CALL gadgets]; /gC; ?e [legacy]; /R; q"
+}
+
 fn run_rop_tool(tool: &RopTool, binary: &str, work_dir: &std::path::Path) -> Result<String, String> {
     let output = match tool {
         RopTool::ROPgadget => Command::new("ROPgadget")
@@ -85,17 +101,16 @@ fn run_rop_tool(tool: &RopTool, binary: &str, work_dir: &std::path::Path) -> Res
             .current_dir(work_dir)
             .output()
             .map_err(|e| format!("ropper error: {e}"))?,
-        // r2 -q: quiet mode (no banner); -c "aaa;/R;q": analyse, list ROP gadgets, quit.
+        // r2 -q: quiet mode (no banner); the script lists ret/jump/call gadgets.
         RopTool::Radare2 => Command::new("r2")
-            .args(["-q", "-c", "aaa;/R;q", binary])
+            .args(["-q", "-c", r2_gadget_script(), binary])
             .current_dir(work_dir)
             .output()
             .map_err(|e| format!("radare2 error: {e}"))?,
     };
 
     let text = String::from_utf8_lossy(&output.stdout).to_string();
-    // Truncate to first 200 gadget lines
-    let lines: Vec<&str> = text.lines().take(200).collect();
+    let lines: Vec<&str> = text.lines().take(GADGET_LINE_CAP).collect();
     Ok(lines.join("\n"))
 }
 
@@ -508,7 +523,7 @@ pub async fn generate_poc(
     let gadgets = match run_rop_tool(&rop_tool, reproducer_path.to_str().unwrap(), &temp_dir) {
         Ok(g) => {
             let count = g.lines().count();
-            emit(&app, format!("      Found {count} gadget lines (truncated at 200)"));
+            emit(&app, format!("      Found {count} gadget lines (truncated at {GADGET_LINE_CAP})"));
             g
         }
         Err(e) => {
@@ -726,6 +741,23 @@ mod tests {
         // REPRODUCER_MAIN must never contain the rename macro — that would
         // defeat the purpose of the two-pass pre-compile workaround.
         assert!(!REPRODUCER_MAIN.contains("__guzzle_target_main"));
+    }
+
+    #[test]
+    fn r2_gadget_script_uses_modern_g_family_with_legacy_fallback() {
+        let s = r2_gadget_script();
+        // Modern radare2 6.x split: return / jump / call gadgets. Jump + call
+        // (br, bl/blr) are the JOP primitives that matter on arm64, where ret
+        // gadgets are scarce.
+        assert!(s.contains("/gR"), "must request return (ret) gadgets");
+        assert!(s.contains("/gJ"), "must request jump (br) gadgets");
+        assert!(s.contains("/gC"), "must request call (bl/blr) gadgets");
+        // Legacy ret-gadget search for pre-6.x r2; the unsupported command on
+        // either version just errors to stderr.
+        assert!(s.contains("; /R;"), "must keep legacy /R fallback");
+        // Gadget search is a linear byte scan; full analysis (aaa) is needless
+        // and slow on large binaries.
+        assert!(!s.contains("aaa"), "must not run full analysis");
     }
 
     #[test]
