@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 use super::ai::{call_ai, AiProvider};
@@ -153,12 +154,43 @@ enum ReproOutcome {
     /// Non-zero exit with no crash signal: the reproducer harness bailed (bad
     /// crash file, read error) rather than the target crashing. Not reproduced.
     NonCrashExit,
+    /// Did not terminate within the verify budget and was killed. A hang is a
+    /// real finding (DoS-class), but it is not a native fault we can take down
+    /// the ROP/pwntools path, so it is its own verdict.
+    Timeout,
 }
 
 impl ReproOutcome {
     /// Whether this outcome represents a genuine crash worth exploiting.
     fn is_crash(&self) -> bool {
         matches!(self, ReproOutcome::Crashed)
+    }
+
+    /// Whether the reproducer ran past its budget and was killed.
+    fn is_timeout(&self) -> bool {
+        matches!(self, ReproOutcome::Timeout)
+    }
+}
+
+/// Run `cmd` to completion, or kill it and report a timeout if it outlives
+/// `budget`. Returns `(timed_out, status)`: when the budget is exceeded the
+/// child is killed and reaped, `timed_out` is `true`, and `status` is `None`.
+///
+/// This is the guard for the in-process verify run: a reproducer that hangs
+/// (rather than crashing) must not block the wizard forever, and no external
+/// `timeout` wrapper can reach a child spawned inside the backend.
+async fn run_bounded(
+    cmd: tokio::process::Command,
+    budget: Duration,
+) -> std::io::Result<(bool, Option<std::process::ExitStatus>)> {
+    let mut cmd = cmd;
+    let mut child = cmd.spawn()?;
+    match tokio::time::timeout(budget, child.wait()).await {
+        Ok(status) => Ok((false, Some(status?))),
+        Err(_elapsed) => {
+            let _ = child.kill().await;
+            Ok((true, None))
+        }
     }
 }
 
@@ -167,8 +199,10 @@ impl ReproOutcome {
 /// `signal` is the terminating signal number on Unix (`None` on Windows or when
 /// the process exited normally); `code` is the normal exit code when present.
 #[cfg(unix)]
-fn classify_repro(signal: Option<i32>, code: Option<i32>) -> ReproOutcome {
-    if signal.is_some() {
+fn classify_repro(timed_out: bool, signal: Option<i32>, code: Option<i32>) -> ReproOutcome {
+    if timed_out {
+        ReproOutcome::Timeout
+    } else if signal.is_some() {
         ReproOutcome::Crashed
     } else if code == Some(0) {
         ReproOutcome::CleanExit
@@ -181,7 +215,10 @@ fn classify_repro(signal: Option<i32>, code: Option<i32>) -> ReproOutcome {
 /// exit code (high bit set, e.g. `0xC0000005` access violation, `0xC000001D`
 /// illegal instruction).
 #[cfg(windows)]
-fn classify_repro(_signal: Option<i32>, code: Option<i32>) -> ReproOutcome {
+fn classify_repro(timed_out: bool, _signal: Option<i32>, code: Option<i32>) -> ReproOutcome {
+    if timed_out {
+        return ReproOutcome::Timeout;
+    }
     match code {
         Some(0) => ReproOutcome::CleanExit,
         Some(c) if (c as u32) >= 0xC000_0000 => ReproOutcome::Crashed,
@@ -474,25 +511,35 @@ pub async fn generate_poc(
     // non-crash exit means the harness bailed. Neither is worth the exploit path,
     // so we stop here rather than hand the AI a crash that doesn't exist.
     emit(&app, "[ 5/6 ] Verifying crash reproduces…");
-    let verify = Command::new(reproducer_path.to_str().unwrap())
+    // The reproducer replays a single fuzz input. The fuzzer found this crash while
+    // executing thousands of inputs per second, so a healthy replay returns in
+    // milliseconds; anything still alive after the budget is a hang, not a crash.
+    // Bound the run and kill on overrun — `.output()` with no bound would wedge the
+    // wizard at step 5/6 forever (no Ctrl-C reaches this in-process child).
+    const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let mut verify_cmd = tokio::process::Command::new(reproducer_path.to_str().unwrap());
+    verify_cmd
         .arg(&crash_path)
         .current_dir(&temp_dir)
-        .output();
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
-    let out = verify.map_err(|e| {
+    let (timed_out, status) = run_bounded(verify_cmd, VERIFY_TIMEOUT).await.map_err(|e| {
         format!("Could not run reproducer to verify the crash: {e}. Aborting — cannot confirm the crash is real.")
     })?;
 
     #[cfg(unix)]
     let signal = {
         use std::os::unix::process::ExitStatusExt;
-        out.status.signal()
+        status.and_then(|s| s.signal())
     };
     #[cfg(not(unix))]
     let signal: Option<i32> = None;
 
-    let code = out.status.code();
-    let outcome = classify_repro(signal, code);
+    let code = status.and_then(|s| s.code());
+    let outcome = classify_repro(timed_out, signal, code);
     if outcome.is_crash() {
         let how = signal
             .map(|s| format!("signal {s}"))
@@ -501,6 +548,12 @@ pub async fn generate_poc(
         emit(&app, format!("      Crash reproduced on sanitizer-free binary ({how}) ✓"));
     } else {
         let reason = match outcome {
+            ReproOutcome::Timeout => format!(
+                "The reproducer did not terminate within {}s and was killed. That is a hang \
+                 (DoS-class), not a memory-corruption crash — it can't drive the ROP/pwntools \
+                 path, but the non-termination on this input is itself the finding.",
+                VERIFY_TIMEOUT.as_secs()
+            ),
             ReproOutcome::CleanExit =>
                 "The sanitizer-free reproducer exited cleanly (0). This crash was an \
                  ASan-only catch, not a native fault — not exploitable as-is."
@@ -513,7 +566,8 @@ pub async fn generate_poc(
                 )
             }
         };
-        emit(&app, format!("      Verdict: not exploitable — {reason}"));
+        let label = if outcome.is_timeout() { "hang (DoS-class)" } else { "not exploitable" };
+        emit(&app, format!("      Verdict: {label} — {reason}"));
         return Ok(PocResult::NotExploitable { reason });
     }
 
@@ -814,13 +868,15 @@ mod tests {
         // (src-tauri/), which would trigger Tauri's file watcher and restart
         // the app. We verify the source contains the expected call.
         let src = include_str!("poc.rs");
-        // Find the verify block and confirm current_dir appears before .output()
-        let verify_pos = src.find("let verify = Command::new").expect("verify block not found");
-        let output_pos = src[verify_pos..].find(".output()").expect(".output() not found") + verify_pos;
+        // Find the verify block and confirm current_dir appears before the child
+        // is spawned.
+        let verify_pos = src.find("let mut verify_cmd = tokio::process::Command::new")
+            .expect("verify block not found");
+        let run_pos = src[verify_pos..].find("run_bounded(verify_cmd").expect("run_bounded call not found") + verify_pos;
         let current_dir_pos = src[verify_pos..].find(".current_dir(&temp_dir)").map(|p| p + verify_pos);
         assert!(
-            current_dir_pos.map_or(false, |p| p < output_pos),
-            "reproducer verify Command must set current_dir before .output()"
+            current_dir_pos.map_or(false, |p| p < run_pos),
+            "reproducer verify Command must set current_dir before it is run"
         );
     }
 
@@ -828,24 +884,24 @@ mod tests {
     #[test]
     fn classify_repro_unix_signal_is_crash() {
         // Killed by SIGSEGV / SIGABRT / SIGBUS → genuine native crash.
-        assert_eq!(classify_repro(Some(11), None), ReproOutcome::Crashed);
-        assert_eq!(classify_repro(Some(6), None), ReproOutcome::Crashed);
-        assert_eq!(classify_repro(Some(10), None), ReproOutcome::Crashed);
+        assert_eq!(classify_repro(false, Some(11), None), ReproOutcome::Crashed);
+        assert_eq!(classify_repro(false, Some(6), None), ReproOutcome::Crashed);
+        assert_eq!(classify_repro(false, Some(10), None), ReproOutcome::Crashed);
     }
 
     #[cfg(unix)]
     #[test]
     fn classify_repro_unix_exit_zero_is_clean() {
         // Ran to completion with 0 → only ASan would have caught it. Not a crash.
-        assert_eq!(classify_repro(None, Some(0)), ReproOutcome::CleanExit);
+        assert_eq!(classify_repro(false, None, Some(0)), ReproOutcome::CleanExit);
     }
 
     #[cfg(unix)]
     #[test]
     fn classify_repro_unix_nonzero_exit_is_not_crash() {
         // Non-zero exit with no signal = harness/file problem, not a reproduced crash.
-        assert_eq!(classify_repro(None, Some(1)), ReproOutcome::NonCrashExit);
-        assert_eq!(classify_repro(None, None), ReproOutcome::NonCrashExit);
+        assert_eq!(classify_repro(false, None, Some(1)), ReproOutcome::NonCrashExit);
+        assert_eq!(classify_repro(false, None, None), ReproOutcome::NonCrashExit);
     }
 
     #[cfg(windows)]
@@ -853,15 +909,15 @@ mod tests {
     fn classify_repro_windows_exception_code_is_crash() {
         // No signals on Windows; a crash surfaces as an NTSTATUS exception code
         // with the high bit set, e.g. 0xC0000005 (access violation).
-        assert_eq!(classify_repro(None, Some(0xC0000005u32 as i32)), ReproOutcome::Crashed);
-        assert_eq!(classify_repro(None, Some(0xC000001Du32 as i32)), ReproOutcome::Crashed);
+        assert_eq!(classify_repro(false, None, Some(0xC0000005u32 as i32)), ReproOutcome::Crashed);
+        assert_eq!(classify_repro(false, None, Some(0xC000001Du32 as i32)), ReproOutcome::Crashed);
     }
 
     #[cfg(windows)]
     #[test]
     fn classify_repro_windows_clean_and_benign() {
-        assert_eq!(classify_repro(None, Some(0)), ReproOutcome::CleanExit);
-        assert_eq!(classify_repro(None, Some(1)), ReproOutcome::NonCrashExit);
+        assert_eq!(classify_repro(false, None, Some(0)), ReproOutcome::CleanExit);
+        assert_eq!(classify_repro(false, None, Some(1)), ReproOutcome::NonCrashExit);
     }
 
     #[test]
@@ -869,5 +925,52 @@ mod tests {
         assert!(ReproOutcome::Crashed.is_crash());
         assert!(!ReproOutcome::CleanExit.is_crash());
         assert!(!ReproOutcome::NonCrashExit.is_crash());
+        assert!(!ReproOutcome::Timeout.is_crash());
+    }
+
+    #[test]
+    fn timed_out_run_is_a_timeout_regardless_of_status() {
+        // A reproducer that blew past the budget is a Timeout verdict even if the
+        // kill left a signal or code behind — the budget outcome wins.
+        assert_eq!(classify_repro(true, None, None), ReproOutcome::Timeout);
+        assert_eq!(classify_repro(true, Some(9), None), ReproOutcome::Timeout);
+        assert_eq!(classify_repro(true, None, Some(0)), ReproOutcome::Timeout);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bounded_returns_status_when_process_finishes_in_time() {
+        // A process that exits well within budget is reported as not-timed-out,
+        // carrying its real exit status through.
+        let cmd = tokio::process::Command::new("true");
+        let (timed_out, status) = run_bounded(cmd, Duration::from_secs(10)).await.unwrap();
+        assert!(!timed_out);
+        assert_eq!(status.and_then(|s| s.code()), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bounded_kills_and_flags_a_process_that_outlives_the_budget() {
+        // A process that outlives the budget is killed promptly and flagged as a
+        // timeout — we must NOT block for the process's full lifetime.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let (timed_out, status) = run_bounded(cmd, Duration::from_millis(200)).await.unwrap();
+        assert!(timed_out);
+        assert!(status.is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "run_bounded should have killed the child, not waited out its 30s sleep"
+        );
+    }
+
+    #[test]
+    fn timeout_is_not_a_crash_but_is_a_distinct_verdict() {
+        // A hang is a real finding (DoS-class), but it is NOT fed to the native
+        // ROP/pwntools exploit path — classify it apart from Crashed.
+        assert!(!ReproOutcome::Timeout.is_crash());
+        assert!(ReproOutcome::Timeout.is_timeout());
+        assert!(!ReproOutcome::Crashed.is_timeout());
     }
 }
