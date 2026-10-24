@@ -1,0 +1,6 @@
+# pnpm build-script approvals (single-package repo — no workspace packages).
+# esbuild installs a prebuilt native binary via its postinstall script; pnpm
+# blocks dependency build scripts by default, so it must be allowed or vite's
+# esbuild transform fails at build time.
+allowBuilds:
+  esbuild: true
