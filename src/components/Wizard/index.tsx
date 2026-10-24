@@ -39,21 +39,25 @@ export default function Wizard() {
   return (
     <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="wizard-title"
         className="bg-[#161b22] border border-[#30363d] rounded-xl shadow-2xl w-full h-full max-w-[1600px] flex flex-col"
         style={{ minHeight: 520 }}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#30363d]">
-          <div className="flex items-center gap-3">
-            <span className="text-lg">⚡</span>
+          <div className="flex items-center gap-3" id="wizard-title">
+            <span className="text-lg" aria-hidden="true">⚡</span>
             <span className="font-semibold text-[#e6edf3]">Fuzz Wizard</span>
             <span className="text-sm text-[#8b949e]">— {subtitle}</span>
           </div>
           <button
             onClick={closeWizard}
+            aria-label="Close wizard"
             className="text-[#8b949e] hover:text-[#e6edf3] text-xl leading-none transition-colors"
           >
-            ×
+            <span aria-hidden="true">×</span>
           </button>
         </div>
 
