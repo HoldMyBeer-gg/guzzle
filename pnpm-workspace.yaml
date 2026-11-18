@@ -4,3 +4,8 @@
 # esbuild transform fails at build time.
 allowBuilds:
   esbuild: true
+
+# monaco-editor pins dompurify to an exact version with open advisories
+# (fixed in 3.4.17). Drop this once monaco ships a release that pins >= 3.4.17.
+overrides:
+  dompurify: ">=3.4.17 <4"
