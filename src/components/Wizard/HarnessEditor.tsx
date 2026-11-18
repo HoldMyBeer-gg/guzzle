@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import MonacoEditor from "@monaco-editor/react";
 import { useSession, PRESET_PROVIDERS, type AiProvider } from "../../store/session";
-import { generateHarness, generateHarnessBinary, saveApiKey, loadApiKey, getCachedHarness, saveCachedHarness } from "../../lib/tauri";
+import { generateHarness, generateHarnessBinary, getCachedHarness, saveCachedHarness } from "../../lib/tauri";
+import { loadKey, saveKey } from "../../lib/apiKeyStore";
 
 interface Props {
   onBack: () => void;
@@ -46,31 +47,16 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
   const [savingKey, setSavingKey] = useState(false);
   const [saveKeyError, setSaveKeyError] = useState<string | null>(null);
 
-  const lsKey = (name: string) => `guzzle_apikey_${name}`;
-
-  const loadKey = async (name: string): Promise<string | null> => {
-    // Try keychain first, fall back to localStorage
-    try {
-      const key = await loadApiKey(name);
-      if (key) return key;
-    } catch (e) {
-      console.warn("Keychain unavailable, falling back to localStorage:", e);
-    }
-    return localStorage.getItem(lsKey(name));
-  };
-
-  const saveKey = async (name: string, key: string) => {
+  const persistKey = async (name: string, key: string) => {
     setSavingKey(true);
     setSaveKeyError(null);
     try {
-      await saveApiKey(name, key);
+      await saveKey(name, key);
     } catch (e) {
-      // Keychain unavailable (unsigned dev build, etc.) — fall back to localStorage
-      setSaveKeyError(`Keychain unavailable, saved locally instead. (${String(e)})`);
+      setSaveKeyError(`Couldn't save to the system keychain; the key is kept for this session only. (${String(e)})`);
+    } finally {
+      setSavingKey(false);
     }
-    // Always save to localStorage as backup
-    localStorage.setItem(lsKey(name), key);
-    setSavingKey(false);
   };
 
   // Load saved key for current provider on mount / provider name change
@@ -79,7 +65,7 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
       .then((key) => {
         if (key) setProvider((p) => ({ ...p, api_key: key }));
       })
-      .catch((e) => console.warn("Failed to load API key on provider change:", e));
+      .catch((e) => setSaveKeyError(`Couldn't read the saved key from the system keychain. (${String(e)})`));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider.name]);
 
@@ -92,7 +78,7 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
       // Load saved key for this preset
       loadKey(name)
         .then((key) => { if (key) setProvider((p) => ({ ...p, api_key: key })); })
-        .catch((e) => console.warn("Failed to load API key for preset:", e));
+        .catch((e) => setSaveKeyError(`Couldn't read the saved key from the system keychain. (${String(e)})`));
     } else {
       // "custom" option
       setIsCustom(true);
@@ -102,7 +88,7 @@ export default function HarnessEditor({ onBack, onNext }: Props) {
 
   const handleSaveKey = async () => {
     if (!provider.api_key) return;
-    await saveKey(provider.name, provider.api_key);
+    await persistKey(provider.name, provider.api_key);
   };
 
   const getContextLines = () => {
